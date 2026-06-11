@@ -23,6 +23,7 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -181,6 +182,54 @@ NON_PERSON_ORG_TERMS = {
     "section",
     "item",
 }
+DOCUMENT_NAME_TERMS = {
+    "agreement",
+    "plan",
+    "act",
+    "policy",
+    "exhibit",
+    "schedule",
+    "compensation",
+}
+DOCUMENT_NAME_PHRASES = {
+    "stock unit",
+    "restricted stock",
+    "restricted stock unit",
+    "deferred restricted stock unit",
+    "securities exchange act",
+}
+TITLE_ONLY_PHRASES = {
+    "executive vice president",
+    "chief financial officer",
+    "chief executive officer",
+    "president",
+    "director",
+}
+TITLE_WORDS = {
+    "acting",
+    "assistant",
+    "chief",
+    "chair",
+    "chairman",
+    "chairperson",
+    "co",
+    "corporate",
+    "director",
+    "executive",
+    "financial",
+    "general",
+    "independent",
+    "interim",
+    "lead",
+    "legal",
+    "officer",
+    "president",
+    "principal",
+    "secretary",
+    "senior",
+    "treasurer",
+    "vice",
+}
 NAME_CAPTURE_PATTERN = r"[A-Z][a-zA-Z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][a-zA-Z'’.-]+)){1,4}"
 NAME_RE = re.compile(rf"\b({NAME_CAPTURE_PATTERN})\b")
 XBRL_TAG_RE = re.compile(
@@ -188,6 +237,7 @@ XBRL_TAG_RE = re.compile(
     re.I,
 )
 WHITESPACE_RE = re.compile(r"\s+")
+LOGGER = logging.getLogger("constellation")
 
 ITEM_HEADING_RE = re.compile(r"\bItem\s+([0-9]{1,2}[A-Z]?)\s*[.:\-–—]", re.I)
 EXECUTIVE_OFFICER_CONTEXT_RE = re.compile(r"executive\s+officers?", re.I)
@@ -465,36 +515,80 @@ def is_sec_section_or_taxonomy_label(name: str) -> bool:
     return False
 
 
-def is_plausible_person_name(name: str) -> bool:
+def person_name_rejection_reason(name: str) -> str | None:
+    """Return why a candidate is not a strict person-like name, or None if valid."""
     raw = clean_text(name)
     normalized = normalize_name(raw)
     if not normalized:
-        return False
+        return "empty_after_normalization"
     lowered = normalized.lower()
+    lowered_raw = raw.lower().strip(" .:-–—")
+    compact_lowered = re.sub(r"\s+", " ", lowered)
     if lowered in NAME_STOPWORDS or is_sec_section_or_taxonomy_label(raw):
-        return False
+        return "sec_section_or_stopword"
+    for phrase in DOCUMENT_NAME_PHRASES:
+        if re.search(rf"\b{re.escape(phrase)}\b", compact_lowered) or re.search(
+            rf"\b{re.escape(phrase)}\b", lowered_raw
+        ):
+            return "document_name_phrase"
     parts = normalized.split()
-    if len(parts) < 2 or len(parts) > 5:
-        return False
+    if len(parts) < 2:
+        return "too_few_tokens"
+    if len(parts) > 5:
+        return "too_many_tokens"
+    alpha_tokens = [part for part in parts if re.search(r"[A-Za-z]", part)]
+    if len(alpha_tokens) < 2:
+        return "too_few_alpha_tokens"
+    token_words = [part.lower().strip(".,") for part in parts]
+    if compact_lowered in TITLE_ONLY_PHRASES:
+        return "title_only_phrase"
+    if all(token in TITLE_WORDS for token in token_words):
+        return "all_title_words"
+    if any(token in DOCUMENT_NAME_TERMS for token in token_words):
+        return "document_name_term"
     blocked_tokens = {"and", "or", "the", "for", "with", "from", "of", "in", "to", "by", "as"}
-    if any(part.lower().strip(".") in blocked_tokens for part in parts):
-        return False
-    if any(part.lower().strip(".,") in NON_PERSON_ORG_TERMS for part in parts):
-        return False
+    if any(token in blocked_tokens for token in token_words):
+        return "blocked_connector_token"
+    if any(token in NON_PERSON_ORG_TERMS for token in token_words):
+        return "organization_term"
     if not all(re.match(r"^[A-Z][a-zA-Z'’.-]*$|^[A-Z]\.$", part) for part in parts):
-        return False
+        return "invalid_name_casing_or_characters"
     # Names should not be made entirely of filing/accounting vocabulary. This keeps
     # title-cased 10-K headings such as "Legal Proceedings" out of person nodes.
     vocabulary_tokens = {token for label in SEC_SECTION_AND_TAXONOMY_LABELS for token in label.split()}
     if all(part.lower().strip(".") in vocabulary_tokens for part in parts):
+        return "all_filing_vocabulary"
+    return None
+
+
+def log_rejected_person_candidate(name: str, reason: str, context: str = "") -> None:
+    candidate = clean_text(name)
+    if not candidate:
+        return
+    if context:
+        LOGGER.info("Rejected person candidate (%s): %s [%s]", reason, candidate, context)
+    else:
+        LOGGER.info("Rejected person candidate (%s): %s", reason, candidate)
+
+
+def is_plausible_person_name(
+    name: str, *, log_rejection: bool = False, context: str = ""
+) -> bool:
+    reason = person_name_rejection_reason(name)
+    if reason is None:
+        return True
+    if log_rejection:
+        log_rejected_person_candidate(name, reason, context)
+    return False
+
+
+def is_valid_person_relationship(
+    rel: PersonRelationship, *, log_rejection: bool = False, context: str = ""
+) -> bool:
+    valid_relationship_type = rel.relationship_type in {"CEO_OF", "CFO_OF", "EXECUTIVE_OFFICER_OF", "BOARD_OF"}
+    if not valid_relationship_type:
         return False
-    return True
-
-
-def is_valid_person_relationship(rel: PersonRelationship) -> bool:
-    return rel.relationship_type in {"CEO_OF", "CFO_OF", "EXECUTIVE_OFFICER_OF", "BOARD_OF"} and is_plausible_person_name(
-        rel.name
-    )
+    return is_plausible_person_name(rel.name, log_rejection=log_rejection, context=context or rel.relationship_type)
 
 
 def extract_name_before_title(text: str, title_pattern: str) -> list[str]:
@@ -671,18 +765,18 @@ def signature_candidate_names(text: str) -> list[str]:
     slash_pattern = re.compile(rf"/s/\s*({NAME_CAPTURE_PATTERN})", re.I)
     for match in slash_pattern.finditer(text):
         candidate = normalize_signature_name(match.group(1))
-        if is_plausible_person_name(candidate):
+        if is_plausible_person_name(candidate, log_rejection=True, context="signature_slash_candidate"):
             names.append(candidate)
     for match in NAME_RE.finditer(text):
         candidate = normalize_signature_name(match.group(1))
-        if is_plausible_person_name(candidate):
+        if is_plausible_person_name(candidate, log_rejection=True, context="signature_text_candidate"):
             names.append(candidate)
     return names
 
 
 def relationships_from_signature_name_and_title(name: str, title: str) -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
-    if not is_plausible_person_name(name):
+    if not is_plausible_person_name(name, log_rejection=True, context="signature_relationship_candidate"):
         return relationships
     title_lower = title.lower()
     for relationship_type in title_to_relationships(title):
@@ -877,7 +971,7 @@ def merge_primary_then_fallback(
     merged: list[PersonRelationship] = []
     seen: set[tuple[str, str]] = set()
     for rel in list(primary) + list(fallback):
-        if not is_valid_person_relationship(rel):
+        if not is_valid_person_relationship(rel, log_rejection=True, context="merge_relationships"):
             continue
         key = (canonical_name(rel.name), rel.relationship_type)
         if key in seen:
@@ -914,7 +1008,7 @@ def dedupe_relationships(relationships: Iterable[PersonRelationship]) -> list[Pe
     seen: set[tuple[str, str]] = set()
     deduped: list[PersonRelationship] = []
     for rel in relationships:
-        if not is_valid_person_relationship(rel):
+        if not is_valid_person_relationship(rel, log_rejection=True, context="dedupe_relationships"):
             continue
         name = normalize_name(rel.name)
         key = (canonical_name(name), rel.relationship_type)
@@ -941,6 +1035,23 @@ def failure_reason(label: str, exc: Exception | None = None) -> str:
     return f"{label}: {type(exc).__name__}"
 
 
+def configure_rejection_logging(output_dir: Path) -> None:
+    """Persist rejected person-name candidates for extraction debugging."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    log_path = (output_dir / "rejected_person_candidates.log").resolve()
+    if not any(
+        isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path
+        for handler in LOGGER.handlers
+    ):
+        handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        LOGGER.addHandler(handler)
+
+
 def write_outputs(
     output_dir: Path,
     companies: list[Company],
@@ -950,7 +1061,15 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     # Final precision gate before node creation: no Person node or edge is written
     # unless the source value still validates as a real person-like name.
-    edges = [edge for edge in edges if is_plausible_person_name(edge.get("source_person", ""))]
+    edges = [
+        edge
+        for edge in edges
+        if is_plausible_person_name(
+            edge.get("source_person", ""),
+            log_rejection=True,
+            context=f"write_outputs:{edge.get('ticker', '')}",
+        )
+    ]
     company_df = pd.DataFrame(
         [
             {
@@ -1053,6 +1172,7 @@ def print_summary(
 def main() -> int:
     args = parse_args()
     output_dir = Path(args.output_dir)
+    configure_rejection_logging(output_dir)
     cache_dir = output_dir / "cache"
     filings_cache_dir = cache_dir / "filings"
     client = SecClient(args.user_agent, cache_dir)
@@ -1136,11 +1256,27 @@ def main() -> int:
         try:
             html = client.download_text_cached(filing.filing_url, cache_path)
             extraction = parse_filing_with_sources(html, signature_only=args.signature_only)
-            relationships = [rel for rel in extraction.relationships if is_valid_person_relationship(rel)]
-            signature_relationships = [
-                rel for rel in extraction.signature_relationships if is_valid_person_relationship(rel)
+            relationships = [
+                rel
+                for rel in extraction.relationships
+                if is_valid_person_relationship(
+                    rel, log_rejection=True, context=f"{ticker}:relationships"
+                )
             ]
-            item_10_relationships = [rel for rel in extraction.item_10_relationships if is_valid_person_relationship(rel)]
+            signature_relationships = [
+                rel
+                for rel in extraction.signature_relationships
+                if is_valid_person_relationship(
+                    rel, log_rejection=True, context=f"{ticker}:signature"
+                )
+            ]
+            item_10_relationships = [
+                rel
+                for rel in extraction.item_10_relationships
+                if is_valid_person_relationship(
+                    rel, log_rejection=True, context=f"{ticker}:item_10"
+                )
+            ]
             if signature_relationships:
                 signature_successes += 1
             if item_10_relationships:
