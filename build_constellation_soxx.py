@@ -129,8 +129,60 @@ NAME_STOPWORDS = {
     "class ii",
     "class iii",
 }
-NAME_RE = re.compile(
-    r"\b([A-Z][a-zA-Z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][a-zA-Z'’.-]+)){1,4})\b"
+SEC_SECTION_AND_TAXONOMY_LABELS = {
+    "business",
+    "risk factors",
+    "unresolved staff comments",
+    "properties",
+    "legal proceedings",
+    "mine safety disclosures",
+    "market for registrant common equity",
+    "selected financial data",
+    "management discussion and analysis",
+    "quantitative and qualitative disclosures about market risk",
+    "financial statements and supplementary data",
+    "changes in and disagreements with accountants",
+    "controls and procedures",
+    "directors executive officers and corporate governance",
+    "executive compensation",
+    "security ownership of certain beneficial owners and management",
+    "certain relationships and related transactions",
+    "principal accountant fees and services",
+    "exhibits and financial statement schedules",
+    "form 10 k summary",
+    "segment reporting",
+    "income taxes",
+    "revenue recognition",
+    "goodwill",
+    "share based compensation",
+    "stock based compensation",
+    "fair value measurements",
+    "derivative instruments",
+    "commitments and contingencies",
+    "subsequent events",
+}
+NON_PERSON_ORG_TERMS = {
+    "company",
+    "corporation",
+    "inc",
+    "incorporated",
+    "limited",
+    "ltd",
+    "plc",
+    "group",
+    "holdings",
+    "technologies",
+    "semiconductor",
+    "committee",
+    "board",
+    "section",
+    "item",
+}
+NAME_CAPTURE_PATTERN = r"[A-Z][a-zA-Z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][a-zA-Z'’.-]+)){1,4}"
+NAME_RE = re.compile(rf"\b({NAME_CAPTURE_PATTERN})\b")
+XBRL_TAG_RE = re.compile(
+    r"^(?:[a-z][a-z0-9-]*:)?[a-z][a-z0-9]*(?:_[a-z0-9]+)+$|^(?:us-gaap|dei|srt|country|currency):",
+    re.I,
 )
 WHITESPACE_RE = re.compile(r"\s+")
 
@@ -364,30 +416,69 @@ def canonical_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", normalize_name(name).lower())
 
 
+def looks_like_xbrl_tag(value: str) -> bool:
+    compact = clean_text(value)
+    if XBRL_TAG_RE.search(compact):
+        return True
+    # XBRL concepts often appear as CamelCase labels without spaces. Real names in
+    # this parser must be at least two separate tokens, so reject these before
+    # normalization can turn them into person-looking words.
+    return bool(re.fullmatch(r"[A-Za-z]+(?:[A-Z][a-z0-9]+){1,}", compact))
+
+
+def is_sec_section_or_taxonomy_label(name: str) -> bool:
+    raw = clean_text(name)
+    lowered_raw = raw.lower().strip(" .:-–—")
+    normalized = normalize_name(raw)
+    lowered = normalized.lower()
+    label = re.sub(r"\s+", " ", lowered)
+    if lowered_raw in SEC_SECTION_AND_TAXONOMY_LABELS or label in SEC_SECTION_AND_TAXONOMY_LABELS:
+        return True
+    if re.match(r"^item\s+\d{1,2}[a-z]?\b", lowered_raw):
+        return True
+    if looks_like_xbrl_tag(raw):
+        return True
+    return False
+
+
 def is_plausible_person_name(name: str) -> bool:
-    normalized = normalize_name(name)
+    raw = clean_text(name)
+    normalized = normalize_name(raw)
     if not normalized:
         return False
     lowered = normalized.lower()
-    if lowered in NAME_STOPWORDS:
+    if lowered in NAME_STOPWORDS or is_sec_section_or_taxonomy_label(raw):
         return False
     parts = normalized.split()
     if len(parts) < 2 or len(parts) > 5:
         return False
-    if any(part.lower() in {"and", "or", "the", "for", "with", "from"} for part in parts):
+    blocked_tokens = {"and", "or", "the", "for", "with", "from", "of", "in", "to", "by", "as"}
+    if any(part.lower().strip(".") in blocked_tokens for part in parts):
         return False
-    if not all(re.match(r"^[A-Z][A-Za-z'’.-]*$|^[A-Z]\.$", part) for part in parts):
+    if any(part.lower().strip(".,") in NON_PERSON_ORG_TERMS for part in parts):
+        return False
+    if not all(re.match(r"^[A-Z][a-zA-Z'’.-]*$|^[A-Z]\.$", part) for part in parts):
+        return False
+    # Names should not be made entirely of filing/accounting vocabulary. This keeps
+    # title-cased 10-K headings such as "Legal Proceedings" out of person nodes.
+    vocabulary_tokens = {token for label in SEC_SECTION_AND_TAXONOMY_LABELS for token in label.split()}
+    if all(part.lower().strip(".") in vocabulary_tokens for part in parts):
         return False
     return True
+
+
+def is_valid_person_relationship(rel: PersonRelationship) -> bool:
+    return rel.relationship_type in {"CEO_OF", "CFO_OF", "EXECUTIVE_OFFICER_OF", "BOARD_OF"} and is_plausible_person_name(
+        rel.name
+    )
 
 
 def extract_name_before_title(text: str, title_pattern: str) -> list[str]:
     names: list[str] = []
     pattern = re.compile(
-        rf"([A-Z][A-Za-z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’.-]+)){{1,4}})"
+        rf"({NAME_CAPTURE_PATTERN})"
         rf"\s*(?:,|–|-|—|\(|\sis\s|\sserves\sas\s|\swas\s)?\s*"
-        rf"(?:our\s+|the\s+|as\s+)?{title_pattern}",
-        re.I,
+        rf"(?:our\s+|the\s+|as\s+)?(?i:{title_pattern})",
     )
     for match in pattern.finditer(text):
         candidate = normalize_name(match.group(1))
@@ -399,9 +490,8 @@ def extract_name_before_title(text: str, title_pattern: str) -> list[str]:
 def extract_name_after_title(text: str, title_pattern: str) -> list[str]:
     names: list[str] = []
     pattern = re.compile(
-        rf"{title_pattern}\s*(?:is|was|:|,|-|–|—)?\s*"
-        rf"([A-Z][A-Za-z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’.-]+)){{1,4}})",
-        re.I,
+        rf"(?i:{title_pattern})\s*(?:is|was|:|,|-|–|—)?\s*"
+        rf"({NAME_CAPTURE_PATTERN})",
     )
     for match in pattern.finditer(text):
         candidate = normalize_name(match.group(1))
@@ -508,10 +598,9 @@ def extract_executive_officers_from_text(text: str) -> list[PersonRelationship]:
     if not officer_sections:
         return relationships
     row_pattern = re.compile(
-        r"([A-Z][A-Za-z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’.-]+)){1,4})"
+        rf"({NAME_CAPTURE_PATTERN})"
         r"\s*(?:,|–|-|—|\()\s*"
-        r"([^.;]{0,220}?(?:Chief|CEO|CFO|President|Vice President|General Counsel|Secretary|Treasurer|Executive Officer)[^.;]{0,220})",
-        re.I,
+        r"(?i:([^.;]{0,220}?(?:Chief|CEO|CFO|President|Vice President|General Counsel|Secretary|Treasurer|Executive Officer)[^.;]{0,220}))",
     )
     for match in row_pattern.finditer(officer_sections):
         name = normalize_name(match.group(1))
@@ -585,9 +674,8 @@ def extract_board_from_tables(soup: BeautifulSoup) -> list[str]:
 def extract_board_from_text(text: str) -> list[str]:
     names: list[str] = []
     director_pattern = re.compile(
-        r"([A-Z][A-Za-z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’.-]+)){1,4})"
-        r"\s*(?:,|–|-|—)?\s*(?:Independent\s+)?Director\b",
-        re.I,
+        rf"({NAME_CAPTURE_PATTERN})"
+        r"\s*(?:,|–|-|—)?\s*(?i:(?:Independent\s+)?Director\b)",
     )
     for match in director_pattern.finditer(text):
         candidate = normalize_name(match.group(1))
@@ -651,6 +739,8 @@ def dedupe_relationships(relationships: Iterable[PersonRelationship]) -> list[Pe
     seen: set[tuple[str, str]] = set()
     deduped: list[PersonRelationship] = []
     for rel in relationships:
+        if not is_valid_person_relationship(rel):
+            continue
         name = normalize_name(rel.name)
         key = (canonical_name(name), rel.relationship_type)
         if not key[0] or key in seen:
@@ -683,6 +773,9 @@ def write_outputs(
     parse_log: list[dict[str, str]],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Final precision gate before node creation: no Person node or edge is written
+    # unless the source value still validates as a real person-like name.
+    edges = [edge for edge in edges if is_plausible_person_name(edge.get("source_person", ""))]
     company_df = pd.DataFrame(
         [
             {
@@ -849,7 +942,7 @@ def main() -> int:
         cache_path = filings_cache_dir / ticker / f"{filing.accession.replace('-', '')}_{filing.primary_document}"
         try:
             html = client.download_text_cached(filing.filing_url, cache_path)
-            relationships = parse_filing(html)
+            relationships = [rel for rel in parse_filing(html) if is_valid_person_relationship(rel)]
         except Exception as exc:
             failures["filing_parse_error"] += 1
             parse_log.append(
