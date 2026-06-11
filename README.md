@@ -44,6 +44,7 @@ Useful development options:
 python build_constellation_soxx.py --tickers NVDA,AMD
 python build_constellation_soxx.py --limit 5
 python build_constellation_soxx.py --output-dir /tmp/constellation_v0_test
+python build_constellation_soxx.py --signature-only
 ```
 
 ## Graph Model
@@ -92,6 +93,7 @@ Edge fields:
 
 - Use SEC EDGAR 10-K annual report filings as the only V0 filing source
 - Prefer precision-first 10-K signature-page rows for CEO, CFO, and director extraction before Item 10 fallback rows
+- Use `--signature-only` for temporary validation runs that output only signature-page relationships and skip Item 10 extraction, fallback, and merge logic
 - Use the latest 10-K filing for each company
 - Keep SEC User-Agent handling and local filing cache
 - Keep the V0 outputs as `company_nodes.csv`, `person_nodes.csv`, `edges.csv`, and `parse_log.csv`

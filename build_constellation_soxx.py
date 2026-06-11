@@ -276,6 +276,14 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get(SEC_USER_AGENT_ENV, DEFAULT_USER_AGENT),
         help="SEC-compliant User-Agent. Prefer setting CONSTELLATION_SEC_USER_AGENT.",
     )
+    parser.add_argument(
+        "--signature-only",
+        action="store_true",
+        help=(
+            "Temporary validation mode: extract only signature-page relationships and skip Item 10 "
+            "extraction, fallback, and merge logic."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -879,10 +887,16 @@ def merge_primary_then_fallback(
     return dedupe_relationships(merged)
 
 
-def parse_filing_with_sources(html: str) -> FilingExtraction:
+def parse_filing_with_sources(html: str, signature_only: bool = False) -> FilingExtraction:
     soup = BeautifulSoup(html, "lxml")
     full_text = clean_text(soup.get_text(" "))
     signature_relationships = extract_signature_relationships(soup, full_text)
+    if signature_only:
+        return FilingExtraction(
+            relationships=signature_relationships,
+            signature_relationships=signature_relationships,
+            item_10_relationships=[],
+        )
     item_10_relationships = parse_item_10_relationships(soup, full_text)
     relationships = merge_primary_then_fallback(signature_relationships, item_10_relationships)
     return FilingExtraction(
@@ -1011,6 +1025,7 @@ def print_summary(
     failures: Counter,
     signature_successes: int = 0,
     item_10_successes: int = 0,
+    signature_only: bool = False,
 ) -> None:
     print("\nConstellation V0 summary")
     print("========================")
@@ -1023,7 +1038,10 @@ def print_summary(
     signature_rate = (signature_successes / filings_found * 100) if filings_found else 0.0
     item_10_rate = (item_10_successes / filings_found * 100) if filings_found else 0.0
     print(f"signature-page extraction successes: {signature_successes}/{filings_found} ({signature_rate:.1f}%)")
-    print(f"Item 10 extraction successes: {item_10_successes}/{filings_found} ({item_10_rate:.1f}%)")
+    if signature_only:
+        print("Item 10 extraction successes: skipped (--signature-only)")
+    else:
+        print(f"Item 10 extraction successes: {item_10_successes}/{filings_found} ({item_10_rate:.1f}%)")
     print("failures by reason:")
     if failures:
         for reason, count in sorted(failures.items()):
@@ -1049,6 +1067,8 @@ def main() -> int:
     tickers, universe_source = get_universe(args.tickers, args.limit, args.user_agent, cache_dir)
     print(f"Universe source: {universe_source}")
     print(f"SOXX tickers queued: {len(tickers)}")
+    if args.signature_only:
+        print("Signature-only validation mode: Item 10 extraction, fallback, and merge are disabled.")
 
     ticker_map = fetch_sec_ticker_map(client, cache_dir)
     companies: list[Company] = []
@@ -1115,7 +1135,7 @@ def main() -> int:
         cache_path = filings_cache_dir / ticker / f"{filing.accession.replace('-', '')}_{filing.primary_document}"
         try:
             html = client.download_text_cached(filing.filing_url, cache_path)
-            extraction = parse_filing_with_sources(html)
+            extraction = parse_filing_with_sources(html, signature_only=args.signature_only)
             relationships = [rel for rel in extraction.relationships if is_valid_person_relationship(rel)]
             signature_relationships = [
                 rel for rel in extraction.signature_relationships if is_valid_person_relationship(rel)
@@ -1197,6 +1217,7 @@ def main() -> int:
         failures=failures,
         signature_successes=signature_successes,
         item_10_successes=item_10_successes,
+        signature_only=args.signature_only,
     )
     print(f"\nCSV outputs saved under: {output_dir}")
     return 0
