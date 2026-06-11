@@ -2,7 +2,7 @@
 
 Constellation is a graph-based relationship explorer for U.S. public companies, executives, and board members.
 
-The goal is to build a lightweight investor research tool that allows users to search a company or person and visualize relationships such as CEO, CFO, and board membership.
+The goal is to build a lightweight investor research tool that allows users to search a company or person and visualize relationships such as CEO, CFO, executive-officer, and board membership.
 
 ## V0 Scope
 
@@ -11,10 +11,13 @@ The first validation scope is SOXX constituents only.
 V0 is implemented as a standalone Python pipeline that:
 
 - maps tickers to SEC CIKs
-- retrieves the latest DEF 14A proxy filing
+- retrieves the latest 10-K annual report filing only
 - downloads and caches filing HTML
-- parses CEO, CFO, and board members
+- parses Item 10 / Directors, Executive Officers and Corporate Governance from the 10-K
+- extracts CEO, CFO, clearly listed executive officers, and board members
 - exports graph-ready CSV files
+
+Constellation V0 intentionally uses 10-K filings as its primary and only SEC filing source. It does not use proxy filings or any fallback filing type because V0 prioritizes consistent SOXX coverage for the most important Person ↔ Company relationships over proxy-level completeness.
 
 ## Run V0
 
@@ -53,6 +56,7 @@ Relationship types:
 
 - CEO_OF
 - CFO_OF
+- EXECUTIVE_OFFICER_OF
 - BOARD_OF
 
 ## Output Schema
@@ -85,11 +89,14 @@ Edge fields:
 
 ## Rules
 
-- Use SEC EDGAR as the primary source
+- Use SEC EDGAR 10-K annual report filings as the only V0 filing source
+- Use the latest 10-K filing for each company
+- Keep SEC User-Agent handling and local filing cache
+- Keep the V0 outputs as `company_nodes.csv`, `person_nodes.csv`, `edges.csv`, and `parse_log.csv`
 - Use Python first
 - Keep the pipeline standalone
 - Do not build frontend yet
-- Do not use GPT API, LLMs, RAG, vector databases, or paid data providers
+- Do not use GPT API, LLMs, RAG, vector databases, paid data providers, or alternate filing fallbacks
 - Future target stack: Neo4j, FastAPI, React, Cytoscape.js
 
 ## Long-Term Universe
