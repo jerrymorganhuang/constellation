@@ -4,9 +4,10 @@
 This standalone pipeline:
 - fetches the current SOXX holdings universe,
 - maps each ticker to its SEC CIK,
-- finds the latest DEF 14A proxy statement,
+- finds the latest 10-K annual report,
 - downloads and caches the filing HTML,
-- extracts CEO, CFO, and board-member relationships with deterministic rules, and
+- parses Item 10 / Directors, Executive Officers and Corporate Governance,
+- extracts CEO, CFO, executive-officer, and board-member relationships with deterministic rules, and
 - writes graph-ready CSV files compatible with a future Neo4j/Cytoscape app.
 
 Run:
@@ -110,7 +111,7 @@ NAME_STOPWORDS = {
     "chief executive officer",
     "chief financial officer",
     "executive officer",
-    "proxy statement",
+    "annual report",
     "annual meeting",
     "table of contents",
     "corporate governance",
@@ -132,6 +133,9 @@ NAME_RE = re.compile(
     r"\b([A-Z][a-zA-Z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][a-zA-Z'’.-]+)){1,4})\b"
 )
 WHITESPACE_RE = re.compile(r"\s+")
+
+ITEM_HEADING_RE = re.compile(r"\bItem\s+([0-9]{1,2}[A-Z]?)\s*[.:\-–—]", re.I)
+EXECUTIVE_OFFICER_CONTEXT_RE = re.compile(r"executive\s+officers?", re.I)
 
 
 @dataclass(frozen=True)
@@ -313,15 +317,15 @@ def iter_all_submission_rows(client: SecClient, cik: str) -> Iterable[dict[str, 
         yield from flatten_recent_filings({"filings": {"recent": older}})
 
 
-def is_def14a_form(form: str) -> bool:
+def is_10k_form(form: str) -> bool:
     normalized = re.sub(r"[^A-Z0-9]", "", form.upper())
-    return normalized == "DEF14A" or normalized.startswith("DEF14AA")
+    return normalized == "10K"
 
 
-def find_latest_def14a(client: SecClient, company: Company) -> Filing | None:
+def find_latest_10k(client: SecClient, company: Company) -> Filing | None:
     candidates: list[dict[str, str]] = []
     for row in iter_all_submission_rows(client, company.cik):
-        if is_def14a_form(row.get("form", "")):
+        if is_10k_form(row.get("form", "")):
             candidates.append(row)
     if not candidates:
         return None
@@ -417,6 +421,114 @@ def most_common_name(names: list[str]) -> str | None:
     return None
 
 
+def extract_item_section(text: str, item_number: str) -> str:
+    """Return a 10-K item section from flattened filing text when headings are detectable."""
+    matches = list(ITEM_HEADING_RE.finditer(text))
+    for target_index, match in enumerate(matches):
+        if match.group(1).upper() != item_number.upper():
+            continue
+        start = match.start()
+        end = len(text)
+        for next_match in matches[target_index + 1 :]:
+            next_item = next_match.group(1).upper()
+            if next_item in {"11", "12", "13", "14", "15"}:
+                end = next_match.start()
+                break
+        section = text[start:end]
+        # Skip table-of-contents snippets and keep searching for the real item body.
+        if len(section) >= 500:
+            return section
+    return ""
+
+
+def extract_context_sections(text: str, context_pattern: re.Pattern[str], window: int = 6000) -> str:
+    sections: list[str] = []
+    for match in context_pattern.finditer(text):
+        start = max(0, match.start() - window // 4)
+        end = min(len(text), match.end() + window)
+        sections.append(text[start:end])
+    return " ".join(sections)
+
+
+def title_to_relationships(title: str) -> list[str]:
+    lower = title.lower()
+    relationships: list[str] = []
+    if "chief executive officer" in lower or re.search(r"\bceo\b", lower):
+        relationships.append("CEO_OF")
+    if "chief financial officer" in lower or re.search(r"\bcfo\b", lower):
+        relationships.append("CFO_OF")
+    if "executive officer" in lower or any(
+        token in lower
+        for token in (
+            "chief ",
+            "president",
+            "principal accounting officer",
+            "general counsel",
+            "corporate secretary",
+            "treasurer",
+            "executive vice president",
+            "senior vice president",
+        )
+    ):
+        relationships.append("EXECUTIVE_OFFICER_OF")
+    return relationships
+
+
+def extract_executive_officers_from_tables(soup: BeautifulSoup) -> list[PersonRelationship]:
+    relationships: list[PersonRelationship] = []
+    for table in soup.find_all("table"):
+        table_text = clean_text(table.get_text(" "))
+        if not EXECUTIVE_OFFICER_CONTEXT_RE.search(table_text):
+            continue
+        rows = table_rows(table)
+        if len(rows) < 2:
+            continue
+        header = [cell.lower() for cell in rows[0]]
+        name_index = 0
+        for idx, cell in enumerate(header):
+            if "name" in cell or "executive officer" in cell:
+                name_index = idx
+        for row in rows[1:]:
+            if name_index >= len(row):
+                continue
+            name = normalize_name(row[name_index])
+            if not is_plausible_person_name(name) and len(row) > 1:
+                name = normalize_name(row[1])
+            if not is_plausible_person_name(name):
+                continue
+            title = " ".join(cell for idx, cell in enumerate(row) if idx != name_index)
+            for relationship_type in title_to_relationships(title + " executive officer"):
+                relationships.append(PersonRelationship(name, relationship_type))
+    return relationships
+
+
+def extract_executive_officers_from_text(text: str) -> list[PersonRelationship]:
+    relationships: list[PersonRelationship] = []
+    officer_sections = extract_context_sections(text, EXECUTIVE_OFFICER_CONTEXT_RE, window=5000)
+    if not officer_sections:
+        return relationships
+    row_pattern = re.compile(
+        r"([A-Z][A-Za-z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z'’.-]+)){1,4})"
+        r"\s*(?:,|–|-|—|\()\s*"
+        r"([^.;]{0,220}?(?:Chief|CEO|CFO|President|Vice President|General Counsel|Secretary|Treasurer|Executive Officer)[^.;]{0,220})",
+        re.I,
+    )
+    for match in row_pattern.finditer(officer_sections):
+        name = normalize_name(match.group(1))
+        if not is_plausible_person_name(name):
+            continue
+        title = clean_text(match.group(2))
+        for relationship_type in title_to_relationships(title):
+            relationships.append(PersonRelationship(name, relationship_type))
+    return relationships
+
+
+def extract_executive_officers(soup: BeautifulSoup, text: str) -> list[PersonRelationship]:
+    relationships = extract_executive_officers_from_tables(soup)
+    relationships.extend(extract_executive_officers_from_text(text))
+    return dedupe_relationships(relationships)
+
+
 def extract_officers(text: str) -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
     ceo_title = r"(?:President\s+and\s+)?Chief\s+Executive\s+Officer|CEO"
@@ -510,9 +622,24 @@ def dedupe_names(names: Iterable[str]) -> list[str]:
 
 def parse_filing(html: str) -> list[PersonRelationship]:
     soup = BeautifulSoup(html, "lxml")
-    text = clean_text(soup.get_text(" "))
-    relationships = extract_officers(text)
-    board_names = dedupe_names(extract_board_from_tables(soup) + extract_board_from_text(text))
+    full_text = clean_text(soup.get_text(" "))
+    item_10_text = extract_item_section(full_text, "10")
+    item_10_or_full_text = item_10_text or full_text
+
+    # Item 10 is the 10-K source for directors and corporate governance. Some 10-Ks
+    # place the executive-officer table in Part I and cross-reference it from Item 10,
+    # so executive-officer extraction may use the full 10-K text while still staying
+    # within the single 10-K source.
+    relationships = extract_officers(item_10_or_full_text)
+    relationships.extend(extract_executive_officers(soup, full_text))
+
+    item_10_soup = BeautifulSoup(item_10_text, "lxml") if item_10_text else soup
+    board_names = dedupe_names(extract_board_from_tables(item_10_soup) + extract_board_from_text(item_10_or_full_text))
+    if not board_names and item_10_text:
+        # Many annual reports incorporate director detail by reference in Item 10.
+        # Stay 10-K-only by using clearly labeled director names elsewhere in the same filing,
+        # most commonly the signature table.
+        board_names = dedupe_names(extract_board_from_tables(soup) + extract_board_from_text(full_text))
     officer_keys = {canonical_name(rel.name) for rel in relationships}
     for name in board_names:
         if canonical_name(name) in officer_keys or is_plausible_person_name(name):
@@ -628,7 +755,7 @@ def print_summary(
     print("\nConstellation V0 summary")
     print("========================")
     print(f"companies processed: {companies_processed}")
-    print(f"DEF 14A filings found: {filings_found}")
+    print(f"10-K filings found: {filings_found}")
     print(f"companies parsed successfully: {parsed_successfully}")
     print(f"company nodes: {company_nodes}")
     print(f"person nodes: {person_nodes}")
@@ -687,7 +814,7 @@ def main() -> int:
             continue
         companies.append(company)
         try:
-            filing = find_latest_def14a(client, company)
+            filing = find_latest_10k(client, company)
         except Exception as exc:
             failures["sec_submission_error"] += 1
             parse_log.append(
@@ -704,14 +831,14 @@ def main() -> int:
             )
             continue
         if not filing:
-            failures["def14a_not_found"] += 1
+            failures["10k_not_found"] += 1
             parse_log.append(
                 {
                     "ticker": ticker,
                     "cik": company.cik,
                     "company_name": company.company_name,
                     "status": "failed",
-                    "reason": "def14a_not_found",
+                    "reason": "10k_not_found",
                     "filing_date": "",
                     "filing_url": "",
                     "relationships_found": "0",
