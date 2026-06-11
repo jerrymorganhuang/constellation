@@ -242,6 +242,10 @@ LOGGER = logging.getLogger("constellation")
 ITEM_HEADING_RE = re.compile(r"\bItem\s+([0-9]{1,2}[A-Z]?)\s*[.:\-–—]", re.I)
 EXECUTIVE_OFFICER_CONTEXT_RE = re.compile(r"executive\s+officers?", re.I)
 SIGNATURE_HEADING_RE = re.compile(r"\bSIGNATURES\b", re.I)
+SIGNATURE_EXCHANGE_ACT_ANCHOR_RE = re.compile(
+    r"pursuant\s+to\s+the\s+requirements\s+of\s+the\s+securities\s+exchange\s+act\s+of\s+1934",
+    re.I,
+)
 SIGNATURE_TITLE_RE = re.compile(
     r"(?i:chief\s+executive\s+officer|chief\s+financial\s+officer|principal\s+executive\s+officer|"
     r"principal\s+financial\s+officer|\bCEO\b|\bCFO\b|\bdirector\b)"
@@ -816,42 +820,146 @@ def extract_signature_relationships_from_text(signature_text: str) -> list[Perso
     return dedupe_relationships(relationships)
 
 
-def extract_signature_relationships_from_tables(soup: BeautifulSoup) -> list[PersonRelationship]:
-    """Extract signer relationships from signature-like HTML tables.
+def tables_after_signature_anchor(soup: BeautifulSoup) -> list:
+    """Return HTML tables below the Exchange Act signature-page anchor."""
+    tables: list = []
+    seen: set[int] = set()
+    after_anchor = False
+    found_anchor = False
+    for node in soup.descendants:
+        if not after_anchor and isinstance(node, str) and SIGNATURE_EXCHANGE_ACT_ANCHOR_RE.search(node):
+            after_anchor = True
+            found_anchor = True
+            continue
+        if after_anchor and getattr(node, "name", None) == "table" and id(node) not in seen:
+            seen.add(id(node))
+            tables.append(node)
+    return tables if found_anchor else []
 
-    The filters intentionally require signature-page signals to keep precision
-    high; ordinary Item 10 director/officer tables are handled separately.
+
+def table_rows_with_cell_lines(table) -> list[list[list[str]]]:
+    rows: list[list[list[str]]] = []
+    for tr in table.find_all("tr"):
+        row: list[list[str]] = []
+        for cell in tr.find_all(["th", "td"]):
+            raw_lines = cell.get_text("\n").splitlines()
+            lines = [clean_text(line) for line in raw_lines]
+            lines = [line for line in lines if line]
+            if not lines:
+                text = clean_text(cell.get_text(" "))
+                lines = [text] if text else []
+            if lines:
+                row.append(lines)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def flatten_signature_cell_lines(lines: list[str]) -> str:
+    return clean_text(" ".join(lines))
+
+
+def signature_table_column_indexes(rows: list[list[list[str]]]) -> tuple[int | None, int | None, int]:
+    """Return (signature index, title index, first data row) for a signature table."""
+    for row_idx, row in enumerate(rows[:3]):
+        lowered = [flatten_signature_cell_lines(cell).lower() for cell in row]
+        signature_idx = next(
+            (idx for idx, cell in enumerate(lowered) if "signature" in cell or cell in {"name", "signer"}),
+            None,
+        )
+        title_idx = next(
+            (idx for idx, cell in enumerate(lowered) if "title" in cell or "capacity" in cell),
+            None,
+        )
+        if signature_idx is not None and title_idx is not None and signature_idx != title_idx:
+            return signature_idx, title_idx, row_idx + 1
+    return None, None, 0
+
+
+def extract_signature_name_from_cell(lines: list[str]) -> str:
+    """Extract the signer from the signature column, preferring typed non-/s/ lines."""
+    slash_candidates: list[str] = []
+    typed_candidates: list[str] = []
+    for line in lines:
+        if re.search(r"(?i)\bsignature\b", line):
+            continue
+        line_without_slash = re.sub(r"(?i)^\s*/s/\s*", "", line)
+        target = slash_candidates if line_without_slash != line else typed_candidates
+        for candidate_text in [line_without_slash, *[m.group(1) for m in NAME_RE.finditer(line_without_slash)]]:
+            candidate = normalize_signature_name(candidate_text)
+            if is_plausible_person_name(candidate, log_rejection=True, context="signature_table_name_cell"):
+                target.append(candidate)
+    candidates = typed_candidates or slash_candidates
+    return candidates[-1] if candidates else ""
+
+
+def infer_signature_table_indexes(row: list[list[str]]) -> tuple[int | None, int | None]:
+    """Infer signature/title columns for a data row when no header is present."""
+    name_indexes = [idx for idx, cell in enumerate(row) if extract_signature_name_from_cell(cell)]
+    title_indexes = [idx for idx, cell in enumerate(row) if SIGNATURE_TITLE_RE.search(flatten_signature_cell_lines(cell))]
+    for name_idx in name_indexes:
+        for title_idx in title_indexes:
+            if name_idx != title_idx:
+                return name_idx, title_idx
+    return None, None
+
+
+def extract_signature_relationships_from_table(table) -> list[PersonRelationship]:
+    rows = table_rows_with_cell_lines(table)
+    if not rows:
+        return []
+    table_text = clean_text(table.get_text(" "))
+    if SIGNATURE_TITLE_RE.search(table_text) is None:
+        return []
+
+    relationships: list[PersonRelationship] = []
+    signature_idx, title_idx, first_data_row = signature_table_column_indexes(rows)
+    for row in rows[first_data_row:]:
+        row_signature_idx = signature_idx
+        row_title_idx = title_idx
+        if row_signature_idx is None or row_title_idx is None:
+            row_signature_idx, row_title_idx = infer_signature_table_indexes(row)
+        if row_signature_idx is None or row_title_idx is None:
+            continue
+        if row_signature_idx >= len(row) or row_title_idx >= len(row):
+            continue
+
+        title = flatten_signature_cell_lines(row[row_title_idx])
+        if not SIGNATURE_TITLE_RE.search(title):
+            continue
+        name = extract_signature_name_from_cell(row[row_signature_idx])
+        if not name:
+            continue
+        relationships.extend(relationships_from_signature_name_and_title(name, title))
+    return dedupe_relationships(relationships)
+
+
+def extract_signature_relationships_from_tables(soup: BeautifulSoup) -> list[PersonRelationship]:
+    """Extract signer relationships from signature tables below the Exchange Act anchor.
+
+    Table parsing treats the anchor sentence only as a locator. Names come from
+    the row's Signature column and roles come only from the same row's Title
+    column, preventing prose or neighboring rows from leaking into relationships.
     """
     relationships: list[PersonRelationship] = []
-    for table in soup.find_all("table"):
+    anchored_tables = tables_after_signature_anchor(soup)
+    anchored_table_ids = {id(table) for table in anchored_tables}
+    candidate_tables = anchored_tables or list(soup.find_all("table"))
+    for table in candidate_tables:
         table_text = clean_text(table.get_text(" "))
         lower = table_text.lower()
-        has_signature_signal = "/s/" in table_text or "signature" in lower or "pursuant to the requirements" in lower
-        has_title_signal = SIGNATURE_TITLE_RE.search(table_text) is not None
-        if not (has_signature_signal and has_title_signal):
+        if id(table) not in anchored_table_ids and not ("/s/" in table_text or "signature" in lower):
             continue
-        for row in table_rows(table):
-            row_text = clean_text(" ".join(row))
-            if not SIGNATURE_TITLE_RE.search(row_text):
-                continue
-            names: list[str] = []
-            for cell in row:
-                cell_names = signature_candidate_names(cell)
-                if cell_names:
-                    names.extend(cell_names)
-            if not names:
-                names = signature_candidate_names(row_text)
-            if not names:
-                continue
-            relationships.extend(relationships_from_signature_name_and_title(names[-1], row_text))
+        relationships.extend(extract_signature_relationships_from_table(table))
     return dedupe_relationships(relationships)
 
 
 def extract_signature_relationships(soup: BeautifulSoup, full_text: str) -> list[PersonRelationship]:
+    table_relationships = extract_signature_relationships_from_tables(soup)
+    if table_relationships:
+        return table_relationships
     signature_text = extract_signature_section_text(full_text)
-    relationships = extract_signature_relationships_from_tables(soup)
-    relationships.extend(extract_signature_relationships_from_text(signature_text))
-    return dedupe_relationships(relationships)
+    return extract_signature_relationships_from_text(signature_text)
 
 
 def extract_officers(text: str) -> list[PersonRelationship]:
