@@ -111,6 +111,9 @@ NAME_STOPWORDS = {
     "chief executive officer",
     "chief financial officer",
     "executive officer",
+    "principal executive officer",
+    "principal financial officer",
+    "principal accounting officer",
     "annual report",
     "annual meeting",
     "table of contents",
@@ -188,6 +191,12 @@ WHITESPACE_RE = re.compile(r"\s+")
 
 ITEM_HEADING_RE = re.compile(r"\bItem\s+([0-9]{1,2}[A-Z]?)\s*[.:\-–—]", re.I)
 EXECUTIVE_OFFICER_CONTEXT_RE = re.compile(r"executive\s+officers?", re.I)
+SIGNATURE_HEADING_RE = re.compile(r"\bSIGNATURES\b", re.I)
+SIGNATURE_TITLE_RE = re.compile(
+    r"(?i:chief\s+executive\s+officer|chief\s+financial\s+officer|principal\s+executive\s+officer|"
+    r"principal\s+financial\s+officer|\bCEO\b|\bCFO\b|\bdirector\b)"
+)
+SIGNATURE_SECTION_MAX_CHARS = 45000
 
 
 @dataclass(frozen=True)
@@ -209,6 +218,13 @@ class Filing:
 class PersonRelationship:
     name: str
     relationship_type: str
+
+
+@dataclass(frozen=True)
+class FilingExtraction:
+    relationships: list[PersonRelationship]
+    signature_relationships: list[PersonRelationship]
+    item_10_relationships: list[PersonRelationship]
 
 
 class SecClient:
@@ -618,6 +634,124 @@ def extract_executive_officers(soup: BeautifulSoup, text: str) -> list[PersonRel
     return dedupe_relationships(relationships)
 
 
+def extract_signature_section_text(full_text: str) -> str:
+    """Return the terminal 10-K signature section as plain text."""
+    matches = list(SIGNATURE_HEADING_RE.finditer(full_text))
+    if not matches:
+        return ""
+    start = matches[-1].start()
+    return full_text[start : start + SIGNATURE_SECTION_MAX_CHARS]
+
+
+def normalize_signature_name(name: str) -> str:
+    candidate = normalize_name(name)
+    parts = candidate.split()
+    title_starters = {"chair", "chairman", "chairperson", "chief", "president", "executive", "senior", "vice", "director"}
+    for idx, part in enumerate(parts):
+        if idx >= 2 and part.lower().strip(".") in title_starters:
+            candidate = " ".join(parts[:idx])
+            break
+    letters = re.sub(r"[^A-Za-z]", "", candidate)
+    if letters and letters.upper() == letters:
+        candidate = " ".join(part if re.fullmatch(r"[A-Z]\.", part) else part.title() for part in candidate.split())
+    return candidate
+
+
+def signature_candidate_names(text: str) -> list[str]:
+    """Return plausible names in a signature text fragment, preserving proximity order."""
+    names: list[str] = []
+    slash_pattern = re.compile(rf"/s/\s*({NAME_CAPTURE_PATTERN})", re.I)
+    for match in slash_pattern.finditer(text):
+        candidate = normalize_signature_name(match.group(1))
+        if is_plausible_person_name(candidate):
+            names.append(candidate)
+    for match in NAME_RE.finditer(text):
+        candidate = normalize_signature_name(match.group(1))
+        if is_plausible_person_name(candidate):
+            names.append(candidate)
+    return names
+
+
+def relationships_from_signature_name_and_title(name: str, title: str) -> list[PersonRelationship]:
+    relationships: list[PersonRelationship] = []
+    if not is_plausible_person_name(name):
+        return relationships
+    title_lower = title.lower()
+    for relationship_type in title_to_relationships(title):
+        # Signature pages identify the legal signers. Keep CEO/CFO precise and
+        # do not broaden every president/VP signer into an executive-officer edge.
+        if relationship_type in {"CEO_OF", "CFO_OF"}:
+            relationships.append(PersonRelationship(name, relationship_type))
+    if "principal executive officer" in title_lower and not any(rel.relationship_type == "CEO_OF" for rel in relationships):
+        relationships.append(PersonRelationship(name, "CEO_OF"))
+    if "principal financial officer" in title_lower and not any(rel.relationship_type == "CFO_OF" for rel in relationships):
+        relationships.append(PersonRelationship(name, "CFO_OF"))
+    if re.search(r"\bdirector\b", title, re.I):
+        relationships.append(PersonRelationship(name, "BOARD_OF"))
+    return relationships
+
+
+def extract_signature_relationships_from_text(signature_text: str) -> list[PersonRelationship]:
+    """Extract signer relationships from the terminal SIGNATURES block text."""
+    relationships: list[PersonRelationship] = []
+    if not signature_text:
+        return relationships
+    for match in SIGNATURE_TITLE_RE.finditer(signature_text):
+        lookback_start = max(0, match.start() - 220)
+        lookahead_end = min(len(signature_text), match.end() + 180)
+        nearby_before = signature_text[lookback_start : match.start()]
+        names = signature_candidate_names(nearby_before)
+        name = names[-1] if names else ""
+        title_context = signature_text[match.start() : lookahead_end]
+        if not name:
+            # Some precision-friendly signature blocks put the typed name on the
+            # line after the title/date, especially for power-of-attorney rows.
+            after_names = signature_candidate_names(signature_text[match.end() : lookahead_end])
+            name = after_names[0] if after_names else ""
+        if not name:
+            continue
+        relationships.extend(relationships_from_signature_name_and_title(name, title_context))
+    return dedupe_relationships(relationships)
+
+
+def extract_signature_relationships_from_tables(soup: BeautifulSoup) -> list[PersonRelationship]:
+    """Extract signer relationships from signature-like HTML tables.
+
+    The filters intentionally require signature-page signals to keep precision
+    high; ordinary Item 10 director/officer tables are handled separately.
+    """
+    relationships: list[PersonRelationship] = []
+    for table in soup.find_all("table"):
+        table_text = clean_text(table.get_text(" "))
+        lower = table_text.lower()
+        has_signature_signal = "/s/" in table_text or "signature" in lower or "pursuant to the requirements" in lower
+        has_title_signal = SIGNATURE_TITLE_RE.search(table_text) is not None
+        if not (has_signature_signal and has_title_signal):
+            continue
+        for row in table_rows(table):
+            row_text = clean_text(" ".join(row))
+            if not SIGNATURE_TITLE_RE.search(row_text):
+                continue
+            names: list[str] = []
+            for cell in row:
+                cell_names = signature_candidate_names(cell)
+                if cell_names:
+                    names.extend(cell_names)
+            if not names:
+                names = signature_candidate_names(row_text)
+            if not names:
+                continue
+            relationships.extend(relationships_from_signature_name_and_title(names[-1], row_text))
+    return dedupe_relationships(relationships)
+
+
+def extract_signature_relationships(soup: BeautifulSoup, full_text: str) -> list[PersonRelationship]:
+    signature_text = extract_signature_section_text(full_text)
+    relationships = extract_signature_relationships_from_tables(soup)
+    relationships.extend(extract_signature_relationships_from_text(signature_text))
+    return dedupe_relationships(relationships)
+
+
 def extract_officers(text: str) -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
     ceo_title = r"(?:President\s+and\s+)?Chief\s+Executive\s+Officer|CEO"
@@ -708,9 +842,7 @@ def dedupe_names(names: Iterable[str]) -> list[str]:
     return deduped
 
 
-def parse_filing(html: str) -> list[PersonRelationship]:
-    soup = BeautifulSoup(html, "lxml")
-    full_text = clean_text(soup.get_text(" "))
+def parse_item_10_relationships(soup: BeautifulSoup, full_text: str) -> list[PersonRelationship]:
     item_10_text = extract_item_section(full_text, "10")
     item_10_or_full_text = item_10_text or full_text
 
@@ -723,16 +855,45 @@ def parse_filing(html: str) -> list[PersonRelationship]:
 
     item_10_soup = BeautifulSoup(item_10_text, "lxml") if item_10_text else soup
     board_names = dedupe_names(extract_board_from_tables(item_10_soup) + extract_board_from_text(item_10_or_full_text))
-    if not board_names and item_10_text:
-        # Many annual reports incorporate director detail by reference in Item 10.
-        # Stay 10-K-only by using clearly labeled director names elsewhere in the same filing,
-        # most commonly the signature table.
-        board_names = dedupe_names(extract_board_from_tables(soup) + extract_board_from_text(full_text))
     officer_keys = {canonical_name(rel.name) for rel in relationships}
     for name in board_names:
         if canonical_name(name) in officer_keys or is_plausible_person_name(name):
             relationships.append(PersonRelationship(name, "BOARD_OF"))
     return dedupe_relationships(relationships)
+
+
+def merge_primary_then_fallback(
+    primary: Iterable[PersonRelationship], fallback: Iterable[PersonRelationship]
+) -> list[PersonRelationship]:
+    """Prefer primary-source rows, then add non-conflicting fallback rows."""
+    merged: list[PersonRelationship] = []
+    seen: set[tuple[str, str]] = set()
+    for rel in list(primary) + list(fallback):
+        if not is_valid_person_relationship(rel):
+            continue
+        key = (canonical_name(rel.name), rel.relationship_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(rel)
+    return dedupe_relationships(merged)
+
+
+def parse_filing_with_sources(html: str) -> FilingExtraction:
+    soup = BeautifulSoup(html, "lxml")
+    full_text = clean_text(soup.get_text(" "))
+    signature_relationships = extract_signature_relationships(soup, full_text)
+    item_10_relationships = parse_item_10_relationships(soup, full_text)
+    relationships = merge_primary_then_fallback(signature_relationships, item_10_relationships)
+    return FilingExtraction(
+        relationships=relationships,
+        signature_relationships=signature_relationships,
+        item_10_relationships=item_10_relationships,
+    )
+
+
+def parse_filing(html: str) -> list[PersonRelationship]:
+    return parse_filing_with_sources(html).relationships
 
 
 def dedupe_relationships(relationships: Iterable[PersonRelationship]) -> list[PersonRelationship]:
@@ -826,6 +987,10 @@ def write_outputs(
             "filing_date",
             "filing_url",
             "relationships_found",
+            "signature_relationships_found",
+            "signature_success",
+            "item_10_relationships_found",
+            "item_10_success",
         ],
     )
 
@@ -844,6 +1009,8 @@ def print_summary(
     person_nodes: int,
     relationship_edges: int,
     failures: Counter,
+    signature_successes: int = 0,
+    item_10_successes: int = 0,
 ) -> None:
     print("\nConstellation V0 summary")
     print("========================")
@@ -853,6 +1020,10 @@ def print_summary(
     print(f"company nodes: {company_nodes}")
     print(f"person nodes: {person_nodes}")
     print(f"relationship edges: {relationship_edges}")
+    signature_rate = (signature_successes / filings_found * 100) if filings_found else 0.0
+    item_10_rate = (item_10_successes / filings_found * 100) if filings_found else 0.0
+    print(f"signature-page extraction successes: {signature_successes}/{filings_found} ({signature_rate:.1f}%)")
+    print(f"Item 10 extraction successes: {item_10_successes}/{filings_found} ({item_10_rate:.1f}%)")
     print("failures by reason:")
     if failures:
         for reason, count in sorted(failures.items()):
@@ -886,6 +1057,8 @@ def main() -> int:
     failures: Counter = Counter()
     filings_found = 0
     parsed_successfully = 0
+    signature_successes = 0
+    item_10_successes = 0
 
     for index, ticker in enumerate(tickers, start=1):
         print(f"[{index}/{len(tickers)}] {ticker}")
@@ -942,7 +1115,16 @@ def main() -> int:
         cache_path = filings_cache_dir / ticker / f"{filing.accession.replace('-', '')}_{filing.primary_document}"
         try:
             html = client.download_text_cached(filing.filing_url, cache_path)
-            relationships = [rel for rel in parse_filing(html) if is_valid_person_relationship(rel)]
+            extraction = parse_filing_with_sources(html)
+            relationships = [rel for rel in extraction.relationships if is_valid_person_relationship(rel)]
+            signature_relationships = [
+                rel for rel in extraction.signature_relationships if is_valid_person_relationship(rel)
+            ]
+            item_10_relationships = [rel for rel in extraction.item_10_relationships if is_valid_person_relationship(rel)]
+            if signature_relationships:
+                signature_successes += 1
+            if item_10_relationships:
+                item_10_successes += 1
         except Exception as exc:
             failures["filing_parse_error"] += 1
             parse_log.append(
@@ -990,6 +1172,10 @@ def main() -> int:
                 "filing_date": filing.filing_date,
                 "filing_url": filing.filing_url,
                 "relationships_found": str(len(relationships)),
+                "signature_relationships_found": str(len(signature_relationships)),
+                "signature_success": "yes" if signature_relationships else "no",
+                "item_10_relationships_found": str(len(item_10_relationships)),
+                "item_10_success": "yes" if item_10_relationships else "no",
             }
         )
 
@@ -1009,6 +1195,8 @@ def main() -> int:
         person_nodes=len(person_df),
         relationship_edges=len(edge_df),
         failures=failures,
+        signature_successes=signature_successes,
+        item_10_successes=item_10_successes,
     )
     print(f"\nCSV outputs saved under: {output_dir}")
     return 0

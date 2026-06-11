@@ -13,7 +13,8 @@ V0 is implemented as a standalone Python pipeline that:
 - maps tickers to SEC CIKs
 - retrieves the latest 10-K annual report filing only
 - downloads and caches filing HTML
-- parses Item 10 / Directors, Executive Officers and Corporate Governance from the 10-K
+- parses the 10-K signature page as the primary source for CEO, CFO, and director relationships
+- compares signature-page extraction with Item 10 / Directors, Executive Officers and Corporate Governance extraction
 - extracts CEO, CFO, clearly listed executive officers, and board members
 - exports graph-ready CSV files
 
@@ -34,7 +35,7 @@ The script writes all V0 outputs under `data/constellation_v0/`:
 - `company_nodes.csv`
 - `person_nodes.csv`
 - `edges.csv`
-- `parse_log.csv`
+- `parse_log.csv` with signature-page vs. Item 10 extraction counts and success flags
 - `cache/` for downloaded SEC and universe files
 
 Useful development options:
@@ -90,6 +91,7 @@ Edge fields:
 ## Rules
 
 - Use SEC EDGAR 10-K annual report filings as the only V0 filing source
+- Prefer precision-first 10-K signature-page rows for CEO, CFO, and director extraction before Item 10 fallback rows
 - Use the latest 10-K filing for each company
 - Keep SEC User-Agent handling and local filing cache
 - Keep the V0 outputs as `company_nodes.csv`, `person_nodes.csv`, `edges.csv`, and `parse_log.csv`
