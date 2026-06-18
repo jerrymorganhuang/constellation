@@ -1,6 +1,9 @@
 import unittest
 
+from bs4 import BeautifulSoup
+
 from build_constellation_soxx import (
+    extract_signature_relationships_from_table,
     extract_signature_name_from_cell,
     is_plausible_person_name,
     parse_filing_with_sources,
@@ -136,6 +139,85 @@ class StrictPersonNameValidatorTest(unittest.TestCase):
             ("Jen-Hsun Huang", "CFO_OF"),
             [(rel.name, rel.relationship_type) for rel in extraction.relationships],
         )
+
+    def test_signature_table_pairs_repeated_signature_title_groups_qrvo_fixture(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr><th>Signature</th><th>Title</th><th>Signature</th><th>Title</th></tr>
+          <tr>
+            <td>/s/ Robert A. Bruggeworth<br>Robert A. Bruggeworth</td>
+            <td>President and Chief Executive Officer and Director</td>
+            <td>/s/ Grant Brown<br>Grant Brown</td>
+            <td>Chief Financial Officer</td>
+          </tr>
+        </table>
+        </body></html>"""
+
+        table = BeautifulSoup(html, "html.parser").find("table")
+        relationships = extract_signature_relationships_from_table(table)
+
+        self.assertEqual(
+            [(rel.name, rel.relationship_type) for rel in relationships],
+            [
+                ("Robert A Bruggeworth", "CEO_OF"),
+                ("Robert A Bruggeworth", "BOARD_OF"),
+                ("Grant Brown", "CFO_OF"),
+            ],
+        )
+        self.assertNotIn(("Robert A Bruggeworth", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in relationships])
+
+    def test_signature_table_infers_nearest_local_title_for_oled_fixture(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr>
+            <td>/s/ Steven V. Abramson<br>Steven V. Abramson</td>
+            <td>Director</td>
+            <td>/s/ Brian Millard<br>Brian Millard</td>
+            <td>Chief Financial Officer</td>
+          </tr>
+        </table>
+        </body></html>"""
+
+        extraction = parse_filing_with_sources(html, signature_only=True)
+
+        self.assertEqual(
+            [(rel.name, rel.relationship_type) for rel in extraction.relationships],
+            [("Steven V Abramson", "BOARD_OF"), ("Brian Millard", "CFO_OF")],
+        )
+        self.assertNotIn(("Steven V Abramson", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
+
+    def test_signature_table_does_not_pair_left_power_of_attorney_with_cfo_title_cohr_fixture(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr>
+            <td>Attorney-in-fact<br>Officer Pursuant</td>
+            <td>Director</td>
+            <td>/s/ Mary Jane Raymond<br>Mary Jane Raymond</td>
+            <td>Chief Financial Officer</td>
+          </tr>
+          <tr>
+            <td>/s/ R. Anderson<br>R. Anderson</td>
+            <td>Director</td>
+            <td></td>
+            <td></td>
+          </tr>
+        </table>
+        </body></html>"""
+
+        extraction = parse_filing_with_sources(html, signature_only=True)
+
+        self.assertEqual(
+            [(rel.name, rel.relationship_type) for rel in extraction.relationships],
+            [("Officer Pursuant", "BOARD_OF"), ("Mary Jane Raymond", "CFO_OF"), ("R Anderson", "BOARD_OF")],
+        )
+        self.assertNotIn(("Officer Pursuant", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
+        self.assertNotIn(("R Anderson", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
 
 
 if __name__ == "__main__":

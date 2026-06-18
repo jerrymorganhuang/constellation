@@ -880,21 +880,44 @@ def flatten_signature_cell_lines(lines: list[str]) -> str:
     return clean_text(" ".join(lines))
 
 
-def signature_table_column_indexes(rows: list[list[list[str]]]) -> tuple[int | None, int | None, int]:
-    """Return (signature index, title index, first data row) for a signature table."""
+def signature_table_column_pairs(rows: list[list[list[str]]]) -> tuple[list[tuple[int, int]], int]:
+    """Return signature/title column pairs plus first data row for a signature table.
+
+    Some SEC signature pages are laid out as repeated Signature/Title groups in
+    the same row (for example two signers per row). Returning only the first
+    Signature and first Title column lets a later CFO title on the right side of
+    the row leak onto an unrelated left-side signer. Keep every header pair so
+    each signer is matched only to the title in the same column group.
+    """
     for row_idx, row in enumerate(rows[:3]):
         lowered = [flatten_signature_cell_lines(cell).lower() for cell in row]
-        signature_idx = next(
-            (idx for idx, cell in enumerate(lowered) if "signature" in cell or cell in {"name", "signer"}),
-            None,
-        )
-        title_idx = next(
-            (idx for idx, cell in enumerate(lowered) if "title" in cell or "capacity" in cell),
-            None,
-        )
-        if signature_idx is not None and title_idx is not None and signature_idx != title_idx:
-            return signature_idx, title_idx, row_idx + 1
-    return None, None, 0
+        signature_indexes = [
+            idx for idx, cell in enumerate(lowered) if "signature" in cell or cell in {"name", "signer"}
+        ]
+        title_indexes = [idx for idx, cell in enumerate(lowered) if "title" in cell or "capacity" in cell]
+        pairs: list[tuple[int, int]] = []
+        used_titles: set[int] = set()
+        for signature_idx in signature_indexes:
+            available_titles = [idx for idx in title_indexes if idx != signature_idx and idx not in used_titles]
+            if not available_titles:
+                continue
+            # A title normally sits immediately to the right of its signer; if
+            # not, use the closest title header to keep repeated groups local.
+            title_idx = min(available_titles, key=lambda idx: (idx < signature_idx, abs(idx - signature_idx)))
+            used_titles.add(title_idx)
+            pairs.append((signature_idx, title_idx))
+        if pairs:
+            return pairs, row_idx + 1
+    return [], 0
+
+
+def signature_table_column_indexes(rows: list[list[list[str]]]) -> tuple[int | None, int | None, int]:
+    """Return the first signature/title pair for compatibility with older tests."""
+    pairs, first_data_row = signature_table_column_pairs(rows)
+    if not pairs:
+        return None, None, first_data_row
+    signature_idx, title_idx = pairs[0]
+    return signature_idx, title_idx, first_data_row
 
 
 def extract_signature_name_from_cell(lines: list[str]) -> str:
@@ -914,15 +937,29 @@ def extract_signature_name_from_cell(lines: list[str]) -> str:
     return candidates[-1] if candidates else ""
 
 
-def infer_signature_table_indexes(row: list[list[str]]) -> tuple[int | None, int | None]:
-    """Infer signature/title columns for a data row when no header is present."""
+def infer_signature_table_index_pairs(row: list[list[str]]) -> list[tuple[int, int]]:
+    """Infer local signature/title pairs for a data row when no header is present."""
     name_indexes = [idx for idx, cell in enumerate(row) if extract_signature_name_from_cell(cell)]
     title_indexes = [idx for idx, cell in enumerate(row) if SIGNATURE_TITLE_RE.search(flatten_signature_cell_lines(cell))]
-    for name_idx in name_indexes:
-        for title_idx in title_indexes:
-            if name_idx != title_idx:
-                return name_idx, title_idx
-    return None, None
+    pairs: list[tuple[int, int]] = []
+    used_names: set[int] = set()
+    for title_idx in title_indexes:
+        available_names = [idx for idx in name_indexes if idx != title_idx and idx not in used_names]
+        if not available_names:
+            continue
+        # Prefer the nearest name to the left of the title, which matches common
+        # Signature | Title groups; fall back to the closest name on the right.
+        name_idx = min(available_names, key=lambda idx: (idx > title_idx, abs(title_idx - idx)))
+        used_names.add(name_idx)
+        pairs.append((name_idx, title_idx))
+    return pairs
+
+
+def infer_signature_table_indexes(row: list[list[str]]) -> tuple[int | None, int | None]:
+    """Infer the first signature/title pair for compatibility with older tests."""
+    pairs = infer_signature_table_index_pairs(row)
+    return pairs[0] if pairs else (None, None)
+
 
 
 def extract_signature_relationships_from_table(table) -> list[PersonRelationship]:
@@ -934,24 +971,20 @@ def extract_signature_relationships_from_table(table) -> list[PersonRelationship
         return []
 
     relationships: list[PersonRelationship] = []
-    signature_idx, title_idx, first_data_row = signature_table_column_indexes(rows)
+    column_pairs, first_data_row = signature_table_column_pairs(rows)
     for row in rows[first_data_row:]:
-        row_signature_idx = signature_idx
-        row_title_idx = title_idx
-        if row_signature_idx is None or row_title_idx is None:
-            row_signature_idx, row_title_idx = infer_signature_table_indexes(row)
-        if row_signature_idx is None or row_title_idx is None:
-            continue
-        if row_signature_idx >= len(row) or row_title_idx >= len(row):
-            continue
+        row_pairs = column_pairs or infer_signature_table_index_pairs(row)
+        for row_signature_idx, row_title_idx in row_pairs:
+            if row_signature_idx >= len(row) or row_title_idx >= len(row):
+                continue
 
-        title = flatten_signature_cell_lines(row[row_title_idx])
-        if not SIGNATURE_TITLE_RE.search(title):
-            continue
-        name = extract_signature_name_from_cell(row[row_signature_idx])
-        if not name:
-            continue
-        relationships.extend(relationships_from_signature_name_and_title(name, title))
+            title = flatten_signature_cell_lines(row[row_title_idx])
+            if not SIGNATURE_TITLE_RE.search(title):
+                continue
+            name = extract_signature_name_from_cell(row[row_signature_idx])
+            if not name:
+                continue
+            relationships.extend(relationships_from_signature_name_and_title(name, title))
     return dedupe_relationships(relationships)
 
 
