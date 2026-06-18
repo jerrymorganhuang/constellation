@@ -111,3 +111,55 @@ After validation, expand to:
 - Nasdaq 100
 - SOXX
 - Russell 2000
+
+## Load V0 CSVs into Neo4j
+
+Layer 2 loading uses the validated Constellation V0 CSV files and writes them to a local Neo4j instance with the official Neo4j Python driver. The loader defaults to `bolt://localhost:7687` because the script and Neo4j Docker container are expected to run on the same GCP VM.
+
+Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Load the current validated signature-page-only CSV output:
+
+```bash
+python load_neo4j.py \
+  --input-dir data/test_soxx_signature_only \
+  --uri bolt://localhost:7687 \
+  --user neo4j \
+  --password constellation123 \
+  --clear
+```
+
+The `--clear` flag is optional. When provided, the loader runs `MATCH (n) DETACH DELETE n` before creating constraints and loading nodes and relationships.
+
+### Example Cypher Queries
+
+Show all relationships:
+
+```cypher
+MATCH (p:Person)-[r]->(c:Company)
+RETURN p,r,c
+LIMIT 200;
+```
+
+Find cross-company directors:
+
+```cypher
+MATCH (p:Person)-[:BOARD_OF]->(c:Company)
+WITH p, collect(c) AS companies
+WHERE size(companies) >= 2
+UNWIND companies AS c
+MATCH (p)-[r:BOARD_OF]->(c)
+RETURN p,r,c;
+```
+
+Search a person:
+
+```cypher
+MATCH (p:Person)-[r]->(c:Company)
+WHERE toLower(p.name) CONTAINS toLower("Victor Peng")
+RETURN p,r,c;
+```
