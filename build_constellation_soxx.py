@@ -828,6 +828,45 @@ def relationships_from_signature_name_and_title(
     return relationships
 
 
+
+def signature_free_text_debug_events(signature_text: str) -> list[dict[str, object]]:
+    """Return observation-only evidence for free-text signature relationships."""
+    events: list[dict[str, object]] = []
+    if not signature_text:
+        return events
+    for match in SIGNATURE_TITLE_RE.finditer(signature_text):
+        lookback_start = max(0, match.start() - 220)
+        lookahead_end = min(len(signature_text), match.end() + 180)
+        nearby_before = signature_text[lookback_start : match.start()]
+        names = signature_candidate_names(nearby_before)
+        name = names[-1] if names else ""
+        signer_source = "lookback"
+        signer_span = nearby_before
+        title_context = signature_text[match.start() : lookahead_end]
+        if not name:
+            signer_span = signature_text[match.end() : lookahead_end]
+            after_names = signature_candidate_names(signer_span)
+            name = after_names[0] if after_names else ""
+            signer_source = "lookahead"
+        if not name:
+            continue
+        emitted = relationships_from_signature_name_and_title(name, title_context, source="signature_free_text")
+        events.append(
+            {
+                "name": name,
+                "relationships": emitted,
+                "title_match": match.group(0),
+                "title_context": title_context,
+                "signer_span": signer_span,
+                "signer_source": signer_source,
+                "lookback_start": lookback_start,
+                "title_start": match.start(),
+                "title_end": match.end(),
+                "lookahead_end": lookahead_end,
+            }
+        )
+    return events
+
 def extract_signature_relationships_from_text(signature_text: str) -> list[PersonRelationship]:
     """Extract signer relationships from the terminal SIGNATURES block text."""
     relationships: list[PersonRelationship] = []
@@ -1026,6 +1065,14 @@ def format_debug_relationships(relationships: Iterable[PersonRelationship]) -> s
     return ", ".join(f"{rel.name} -> {rel.relationship_type} [source={rel.source}]" for rel in rels)
 
 
+def format_debug_span(text: str, limit: int = 700) -> str:
+    """Keep debug spans readable while preserving the exact normalized text content."""
+    normalized = clean_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]} ... [truncated {len(normalized) - limit} chars]"
+
+
 def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("data")) -> None:
     """Write an observation-only log for the existing SEC signature extraction path."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1144,6 +1191,42 @@ def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("da
     normalized_ticker = normalize_ticker(ticker)
     if normalized_ticker in tracked_targets:
         lines.append("7. Requested CFO edge source trace")
+        signature_text = extract_signature_section_text(soup.get_text(" "))
+        free_text_events = signature_free_text_debug_events(signature_text)
+        table_pairing_details: list[dict[str, object]] = []
+        for table_index, table in enumerate(candidate_tables, start=1):
+            table_text = clean_text(table.get_text(" "))
+            lower = table_text.lower()
+            if id(table) not in anchored_table_ids and not ("/s/" in table_text or "signature" in lower):
+                continue
+            rows = table_rows_with_cell_lines(table)
+            if not rows or SIGNATURE_TITLE_RE.search(table_text) is None:
+                continue
+            column_pairs, first_data_row = signature_table_column_pairs(rows)
+            for row_index, row in enumerate(rows[first_data_row:], start=first_data_row + 1):
+                row_pairs = column_pairs or infer_signature_table_index_pairs(row)
+                for signature_idx, title_idx in row_pairs:
+                    if signature_idx >= len(row) or title_idx >= len(row):
+                        continue
+                    title = flatten_signature_cell_lines(row[title_idx])
+                    if not SIGNATURE_TITLE_RE.search(title):
+                        continue
+                    name = extract_signature_name_from_cell(row[signature_idx])
+                    if not name:
+                        continue
+                    emitted = relationships_from_signature_name_and_title(name, title, source="signature_table")
+                    table_pairing_details.append(
+                        {
+                            "name": name,
+                            "relationships": emitted,
+                            "table_index": table_index,
+                            "row_index": row_index,
+                            "row": row,
+                            "signature_idx": signature_idx,
+                            "title_idx": title_idx,
+                            "title": title,
+                        }
+                    )
         for target_name, target_type in tracked_targets[normalized_ticker]:
             matches = [
                 rel
@@ -1153,6 +1236,30 @@ def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("da
             if matches:
                 for rel in matches:
                     lines.append(f"  {target_name} -> {target_type}: emitted by {rel.source} as {rel.name}")
+                    if rel.source == "signature_free_text":
+                        matching_events = [
+                            event for event in free_text_events
+                            if canonical_name(str(event["name"])) == canonical_name(rel.name)
+                            and any(edge.relationship_type == target_type for edge in event["relationships"])
+                        ]
+                        for event in matching_events:
+                            lines.append(f"    matched title text: {event['title_match']}")
+                            lines.append(f"    matched signer text ({event['signer_source']}): {event['name']}")
+                            lines.append(
+                                f"    exact text span [{event['lookback_start']}:{event['lookahead_end']}]: "
+                                f"{format_debug_span(str(event['signer_span']) + ' ' + str(event['title_context']))}"
+                            )
+                    if rel.source == "signature_table":
+                        matching_pairings = [
+                            detail for detail in table_pairing_details
+                            if canonical_name(str(detail["name"])) == canonical_name(rel.name)
+                            and any(edge.relationship_type == target_type for edge in detail["relationships"])
+                        ]
+                        for detail in matching_pairings:
+                            row_cells = [" | ".join(cell) for cell in detail["row"]]
+                            lines.append(f"    table row: Table {detail['table_index']} row {detail['row_index']}: {row_cells}")
+                            lines.append(f"    title cell: cell {detail['title_idx']}: {detail['title']}")
+                            lines.append(f"    signer cell: cell {detail['signature_idx']}: {detail['name']}")
             else:
                 lines.append(f"  {target_name} -> {target_type}: not emitted")
 

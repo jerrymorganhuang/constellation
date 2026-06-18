@@ -252,6 +252,39 @@ class StrictPersonNameValidatorTest(unittest.TestCase):
         self.assertIn("Robert A Bruggeworth => Robert A Bruggeworth -> CEO_OF", debug_text)
         self.assertIn("Grant Brown => Grant Brown -> CFO_OF", debug_text)
 
+    def test_signature_debug_log_traces_requested_free_text_cfo_evidence(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>/s/ Robert Bruggeworth Chief Financial Officer</p>
+        </body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_signature_debug_log("QRVO", html, Path(tmpdir))
+            debug_text = (Path(tmpdir) / "debug_QRVO.log").read_text(encoding="utf-8")
+
+        self.assertIn("Robert Bruggeworth -> CFO_OF: emitted by signature_free_text", debug_text)
+        self.assertIn("matched title text: Chief Financial Officer", debug_text)
+        self.assertIn("matched signer text (lookback): Robert Bruggeworth", debug_text)
+        self.assertIn("exact text span", debug_text)
+
+    def test_signature_debug_log_traces_requested_table_cfo_evidence(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr><th>Signature</th><th>Title</th></tr>
+          <tr><td>/s/ Steven Abramson<br>Steven Abramson</td><td>Chief Financial Officer</td></tr>
+        </table>
+        </body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_signature_debug_log("OLED", html, Path(tmpdir))
+            debug_text = (Path(tmpdir) / "debug_OLED.log").read_text(encoding="utf-8")
+
+        self.assertIn("Steven Abramson -> CFO_OF: emitted by signature_table", debug_text)
+        self.assertIn("table row: Table 1 row 2", debug_text)
+        self.assertIn("title cell: cell 1: Chief Financial Officer", debug_text)
+        self.assertIn("signer cell: cell 0: Steven Abramson", debug_text)
+
 
 if __name__ == "__main__":
     unittest.main()
