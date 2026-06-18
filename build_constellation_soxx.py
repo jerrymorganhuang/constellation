@@ -539,6 +539,14 @@ def person_name_rejection_reason(name: str) -> str | None:
     compact_lowered = re.sub(r"\s+", " ", lowered)
     if lowered in NAME_STOPWORDS or is_sec_section_or_taxonomy_label(raw):
         return "sec_section_or_stopword"
+    legal_boilerplate_pairs = {
+        ("officer", "pursuant"),
+        ("executive", "pursuant"),
+        ("officer", "requirements"),
+    }
+    token_set = set(compact_lowered.split())
+    if any(left in token_set and right in token_set for left, right in legal_boilerplate_pairs):
+        return "legal_boilerplate_phrase"
     for phrase in DOCUMENT_NAME_PHRASES:
         if re.search(rf"\b{re.escape(phrase)}\b", compact_lowered) or re.search(
             rf"\b{re.escape(phrase)}\b", lowered_raw
@@ -761,6 +769,9 @@ def extract_signature_section_text(full_text: str) -> str:
 def normalize_signature_name(name: str) -> str:
     candidate = normalize_name(name)
     parts = candidate.split()
+    if len(parts) % 2 == 0 and parts[: len(parts) // 2] == parts[len(parts) // 2 :]:
+        candidate = " ".join(parts[: len(parts) // 2])
+        parts = candidate.split()
     title_starters = {"chair", "chairman", "chairperson", "chief", "president", "executive", "senior", "vice", "director"}
     for idx, part in enumerate(parts):
         if idx >= 2 and part.lower().strip(".") in title_starters:
@@ -835,19 +846,11 @@ def signature_free_text_debug_events(signature_text: str) -> list[dict[str, obje
     if not signature_text:
         return events
     for match in SIGNATURE_TITLE_RE.finditer(signature_text):
-        lookback_start = max(0, match.start() - 220)
-        lookahead_end = min(len(signature_text), match.end() + 180)
-        nearby_before = signature_text[lookback_start : match.start()]
-        names = signature_candidate_names(nearby_before)
-        name = names[-1] if names else ""
-        signer_source = "lookback"
-        signer_span = nearby_before
-        title_context = signature_text[match.start() : lookahead_end]
-        if not name:
-            signer_span = signature_text[match.end() : lookahead_end]
-            after_names = signature_candidate_names(signer_span)
-            name = after_names[0] if after_names else ""
-            signer_source = "lookahead"
+        name, signer_span, signer_source, lookback_start, lookahead_end = nearest_signature_name_for_title(
+            signature_text, match
+        )
+        context_end = signature_title_context_end(signature_text, match, lookahead_end)
+        title_context = signature_text[match.start() : context_end]
         if not name:
             continue
         emitted = relationships_from_signature_name_and_title(name, title_context, source="signature_free_text")
@@ -862,10 +865,45 @@ def signature_free_text_debug_events(signature_text: str) -> list[dict[str, obje
                 "lookback_start": lookback_start,
                 "title_start": match.start(),
                 "title_end": match.end(),
-                "lookahead_end": lookahead_end,
+                "lookahead_end": context_end,
             }
         )
     return events
+
+def nearest_signature_name_for_title(signature_text: str, match: re.Match[str]) -> tuple[str, str, str, int, int]:
+    """Return the nearest signer name for a title match without crossing signer/title boundaries."""
+    lookback_start = max(0, match.start() - 220)
+    lookahead_end = min(len(signature_text), match.end() + 180)
+    nearby_before = signature_text[lookback_start : match.start()]
+    slash_boundary = nearby_before.rfind("/s/")
+    if slash_boundary != -1:
+        nearby_before = nearby_before[slash_boundary:]
+        lookback_start = match.start() - len(nearby_before)
+    names = signature_candidate_names(nearby_before)
+    name = names[-1] if names else ""
+    signer_source = "lookback"
+    signer_span = nearby_before
+    if name:
+        name_pos = nearby_before.rfind(name)
+        intervening = nearby_before[name_pos + len(name) :] if name_pos != -1 else nearby_before
+        if SIGNATURE_TITLE_RE.search(intervening):
+            name = ""
+    if not name:
+        signer_span = signature_text[match.end() : lookahead_end]
+        after_names = signature_candidate_names(signer_span)
+        name = after_names[0] if after_names else ""
+        signer_source = "lookahead"
+    return name, signer_span, signer_source, lookback_start, lookahead_end
+
+def signature_title_context_end(signature_text: str, match: re.Match[str], lookahead_end: int) -> int:
+    """Limit a free-text title context to the current title phrase, not the next signer/title block."""
+    next_title = SIGNATURE_TITLE_RE.search(signature_text, match.end())
+    if next_title:
+        between = signature_text[match.end() : next_title.start()].strip().lower()
+        if re.fullmatch(r"(?:,|and|/|&|\s)+", between):
+            return lookahead_end
+        return min(lookahead_end, next_title.start())
+    return lookahead_end
 
 def extract_signature_relationships_from_text(signature_text: str) -> list[PersonRelationship]:
     """Extract signer relationships from the terminal SIGNATURES block text."""
@@ -873,17 +911,11 @@ def extract_signature_relationships_from_text(signature_text: str) -> list[Perso
     if not signature_text:
         return relationships
     for match in SIGNATURE_TITLE_RE.finditer(signature_text):
-        lookback_start = max(0, match.start() - 220)
-        lookahead_end = min(len(signature_text), match.end() + 180)
-        nearby_before = signature_text[lookback_start : match.start()]
-        names = signature_candidate_names(nearby_before)
-        name = names[-1] if names else ""
-        title_context = signature_text[match.start() : lookahead_end]
-        if not name:
-            # Some precision-friendly signature blocks put the typed name on the
-            # line after the title/date, especially for power-of-attorney rows.
-            after_names = signature_candidate_names(signature_text[match.end() : lookahead_end])
-            name = after_names[0] if after_names else ""
+        name, _signer_span, _signer_source, _lookback_start, lookahead_end = nearest_signature_name_for_title(
+            signature_text, match
+        )
+        context_end = signature_title_context_end(signature_text, match, lookahead_end)
+        title_context = signature_text[match.start() : context_end]
         if not name:
             continue
         relationships.extend(relationships_from_signature_name_and_title(name, title_context, source="signature_free_text"))
@@ -943,6 +975,7 @@ def signature_table_column_pairs(rows: list[list[list[str]]]) -> tuple[list[tupl
         signature_indexes = [
             idx for idx, cell in enumerate(lowered) if "signature" in cell or cell in {"name", "signer"}
         ]
+        signature_indexes.sort(key=lambda idx: (lowered[idx] != "name", idx))
         title_indexes = [idx for idx, cell in enumerate(lowered) if "title" in cell or "capacity" in cell]
         pairs: list[tuple[int, int]] = []
         used_titles: set[int] = set()
@@ -993,12 +1026,12 @@ def infer_signature_table_index_pairs(row: list[list[str]]) -> list[tuple[int, i
     pairs: list[tuple[int, int]] = []
     used_names: set[int] = set()
     for title_idx in title_indexes:
-        available_names = [idx for idx in name_indexes if idx != title_idx and idx not in used_names]
+        available_names = [idx for idx in name_indexes if idx < title_idx and idx not in used_names]
         if not available_names:
             continue
         # Prefer the nearest name to the left of the title, which matches common
-        # Signature | Title groups; fall back to the closest name on the right.
-        name_idx = min(available_names, key=lambda idx: (idx > title_idx, abs(title_idx - idx)))
+        # Signature | Title groups. Do not cross rightward into the next signer.
+        name_idx = min(available_names, key=lambda idx: abs(title_idx - idx))
         used_names.add(name_idx)
         pairs.append((name_idx, title_idx))
     return pairs
@@ -1009,6 +1042,13 @@ def infer_signature_table_indexes(row: list[list[str]]) -> tuple[int | None, int
     pairs = infer_signature_table_index_pairs(row)
     return pairs[0] if pairs else (None, None)
 
+def signature_title_cell_has_conflicting_name(title_lines: list[str], signer_name: str) -> bool:
+    """Reject swapped/misaligned table cells where the title cell names another signer."""
+    title_text = flatten_signature_cell_lines(title_lines)
+    for candidate in signature_candidate_names(title_text):
+        if canonical_name(candidate) != canonical_name(signer_name):
+            return True
+    return False
 
 
 def extract_signature_relationships_from_table(table) -> list[PersonRelationship]:
@@ -1033,6 +1073,8 @@ def extract_signature_relationships_from_table(table) -> list[PersonRelationship
             name = extract_signature_name_from_cell(row[row_signature_idx])
             if not name:
                 continue
+            if signature_title_cell_has_conflicting_name(row[row_title_idx], name):
+                continue
             relationships.extend(relationships_from_signature_name_and_title(name, title, source="signature_table"))
     return dedupe_relationships(relationships)
 
@@ -1055,6 +1097,20 @@ def extract_signature_relationships_from_tables(soup: BeautifulSoup) -> list[Per
             continue
         relationships.extend(extract_signature_relationships_from_table(table))
     return dedupe_relationships(relationships)
+
+def has_signature_table_evidence(soup: BeautifulSoup) -> bool:
+    """Return whether signature-like tables were present even if no relationship survived."""
+    anchored_tables = tables_after_signature_anchor(soup)
+    candidate_tables = anchored_tables or list(soup.find_all("table"))
+    anchored_table_ids = {id(table) for table in anchored_tables}
+    for table in candidate_tables:
+        table_text = clean_text(table.get_text(" "))
+        lower = table_text.lower()
+        if id(table) not in anchored_table_ids and not ("/s/" in table_text or "signature" in lower):
+            continue
+        if SIGNATURE_TITLE_RE.search(table_text):
+            return True
+    return False
 
 
 
@@ -1161,6 +1217,11 @@ def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("da
                 name = extract_signature_name_from_cell(row[signature_idx])
                 if not name:
                     continue
+                if signature_title_cell_has_conflicting_name(row[title_idx], name):
+                    lines.append(
+                        f"  Table {table_index} row {row_index}: ignored conflicting title-cell name for {name} => {title}"
+                    )
+                    continue
                 pairings.append((name, title, table_index, row_index, signature_idx))
                 lines.append(f"  Table {table_index} row {row_index}: {name} => {title}")
     if not pairings:
@@ -1213,6 +1274,20 @@ def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("da
                         continue
                     name = extract_signature_name_from_cell(row[signature_idx])
                     if not name:
+                        continue
+                    if signature_title_cell_has_conflicting_name(row[title_idx], name):
+                        table_pairing_details.append(
+                            {
+                                "name": name,
+                                "relationships": [],
+                                "table_index": table_index,
+                                "row_index": row_index,
+                                "row": row,
+                                "signature_idx": signature_idx,
+                                "title_idx": title_idx,
+                                "title": f"IGNORED conflicting title-cell name: {title}",
+                            }
+                        )
                         continue
                     emitted = relationships_from_signature_name_and_title(name, title, source="signature_table")
                     table_pairing_details.append(
@@ -1267,7 +1342,7 @@ def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("da
 
 def extract_signature_relationships(soup: BeautifulSoup, full_text: str) -> list[PersonRelationship]:
     table_relationships = extract_signature_relationships_from_tables(soup)
-    if table_relationships:
+    if table_relationships or has_signature_table_evidence(soup):
         return table_relationships
     signature_text = extract_signature_section_text(full_text)
     return extract_signature_relationships_from_text(signature_text)

@@ -33,6 +33,7 @@ class StrictPersonNameValidatorTest(unittest.TestCase):
             "Chief Financial Officer",
             "President",
             "Director",
+            "Officer Pursuant",
         ):
             with self.subTest(candidate=candidate):
                 self.assertFalse(is_plausible_person_name(candidate))
@@ -217,10 +218,55 @@ class StrictPersonNameValidatorTest(unittest.TestCase):
 
         self.assertEqual(
             [(rel.name, rel.relationship_type) for rel in extraction.relationships],
-            [("Officer Pursuant", "BOARD_OF"), ("Mary Jane Raymond", "CFO_OF"), ("R Anderson", "BOARD_OF")],
+            [("Mary Jane Raymond", "CFO_OF"), ("R Anderson", "BOARD_OF")],
         )
+        self.assertNotIn(("Officer Pursuant", "BOARD_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
         self.assertNotIn(("Officer Pursuant", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
         self.assertNotIn(("R Anderson", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
+
+    def test_signature_free_text_does_not_cross_prior_title_boundary(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>/s/ R. Anderson R. Anderson Director Principal Financial Officer</p>
+        </body></html>"""
+
+        extraction = parse_filing_with_sources(html, signature_only=True)
+
+        self.assertEqual(
+            [(rel.name, rel.relationship_type) for rel in extraction.relationships],
+            [("R Anderson", "BOARD_OF")],
+        )
+
+    def test_signature_name_title_header_pairs_name_column_to_title(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr><th>Signature</th><th>Name</th><th>Title</th></tr>
+          <tr><td>/s/</td><td>Robert A. Bruggeworth</td><td>Chief Executive Officer and Director</td></tr>
+          <tr><td>/s/</td><td>Grant Brown</td><td>Chief Financial Officer</td></tr>
+        </table>
+        </body></html>"""
+
+        extraction = parse_filing_with_sources(html, signature_only=True)
+
+        self.assertEqual(
+            [(rel.name, rel.relationship_type) for rel in extraction.relationships],
+            [("Robert A Bruggeworth", "CEO_OF"), ("Robert A Bruggeworth", "BOARD_OF"), ("Grant Brown", "CFO_OF")],
+        )
+
+    def test_signature_table_ignores_swapped_title_cells_with_other_signer_names(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr><td>Brian Millard</td><td>Steven Abramson Chief Executive Officer</td></tr>
+          <tr><td>Steven Abramson</td><td>Brian Millard Chief Financial Officer</td></tr>
+        </table>
+        </body></html>"""
+
+        extraction = parse_filing_with_sources(html, signature_only=True)
+
+        self.assertEqual(extraction.relationships, [])
 
     def test_signature_debug_log_records_pairings_without_changing_extraction(self):
         html = """<html><body><h1>SIGNATURES</h1>
