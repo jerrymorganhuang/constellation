@@ -230,6 +230,7 @@ TITLE_WORDS = {
     "treasurer",
     "vice",
 }
+SIGNATURE_TABLE_LABEL_TOKENS = {"title", "name", "date", "signature"}
 NAME_CAPTURE_PATTERN = r"[A-Z][a-zA-Z'’.-]+(?:\s+(?:[A-Z]\.|[A-Z][a-zA-Z'’.-]+)){1,4}"
 NAME_RE = re.compile(rf"\b({NAME_CAPTURE_PATTERN})\b")
 XBRL_TAG_RE = re.compile(
@@ -763,17 +764,37 @@ def normalize_signature_name(name: str) -> str:
     return candidate
 
 
+def signature_person_candidate_name(candidate_text: str, context: str) -> str:
+    """Normalize and validate a signature person candidate, repairing trailing table labels only."""
+    candidate = normalize_signature_name(candidate_text)
+    parts = candidate.split()
+    label_indexes = [
+        idx
+        for idx, part in enumerate(parts)
+        if part.strip(".,:;()[]").lower() in SIGNATURE_TABLE_LABEL_TOKENS
+    ]
+    if label_indexes:
+        if label_indexes == [len(parts) - 1]:
+            candidate = " ".join(parts[:-1])
+        else:
+            log_rejected_person_candidate(candidate, "embedded_signature_table_label", context)
+            return ""
+    if is_plausible_person_name(candidate, log_rejection=True, context=context):
+        return candidate
+    return ""
+
+
 def signature_candidate_names(text: str) -> list[str]:
     """Return plausible names in a signature text fragment, preserving proximity order."""
     names: list[str] = []
     slash_pattern = re.compile(rf"/s/\s*({NAME_CAPTURE_PATTERN})", re.I)
     for match in slash_pattern.finditer(text):
-        candidate = normalize_signature_name(match.group(1))
-        if is_plausible_person_name(candidate, log_rejection=True, context="signature_slash_candidate"):
+        candidate = signature_person_candidate_name(match.group(1), "signature_slash_candidate")
+        if candidate:
             names.append(candidate)
     for match in NAME_RE.finditer(text):
-        candidate = normalize_signature_name(match.group(1))
-        if is_plausible_person_name(candidate, log_rejection=True, context="signature_text_candidate"):
+        candidate = signature_person_candidate_name(match.group(1), "signature_text_candidate")
+        if candidate:
             names.append(candidate)
     return names
 
@@ -886,8 +907,8 @@ def extract_signature_name_from_cell(lines: list[str]) -> str:
         line_without_slash = re.sub(r"(?i)^\s*/s/\s*", "", line)
         target = slash_candidates if line_without_slash != line else typed_candidates
         for candidate_text in [line_without_slash, *[m.group(1) for m in NAME_RE.finditer(line_without_slash)]]:
-            candidate = normalize_signature_name(candidate_text)
-            if is_plausible_person_name(candidate, log_rejection=True, context="signature_table_name_cell"):
+            candidate = signature_person_candidate_name(candidate_text, "signature_table_name_cell")
+            if candidate:
                 target.append(candidate)
     candidates = typed_candidates or slash_candidates
     return candidates[-1] if candidates else ""

@@ -1,6 +1,7 @@
 import unittest
 
 from build_constellation_soxx import (
+    extract_signature_name_from_cell,
     is_plausible_person_name,
     parse_filing_with_sources,
     person_name_rejection_reason,
@@ -36,6 +37,20 @@ class StrictPersonNameValidatorTest(unittest.TestCase):
             with self.subTest(candidate=candidate):
                 self.assertTrue(is_plausible_person_name(candidate))
                 self.assertIsNone(person_name_rejection_reason(candidate))
+
+    def test_signature_name_cell_strips_trailing_table_label(self):
+        cases = {
+            "Susan L. Spradley Title": "Susan L Spradley",
+            "Robert A. Bruggeworth Title": "Robert A Bruggeworth",
+        }
+        for candidate, expected in cases.items():
+            with self.subTest(candidate=candidate):
+                self.assertEqual(extract_signature_name_from_cell([candidate]), expected)
+
+    def test_signature_name_cell_rejects_label_only_or_title_phrase_after_strip(self):
+        for candidate in ("Title", "Chief Financial Officer Title"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(extract_signature_name_from_cell([candidate]), "")
 
     def test_signature_only_extraction_filters_non_people(self):
         html = """<html><body><h1>SIGNATURES</h1>
