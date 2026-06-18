@@ -273,6 +273,7 @@ class Filing:
 class PersonRelationship:
     name: str
     relationship_type: str
+    source: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -694,7 +695,7 @@ def title_to_relationships(title: str) -> list[str]:
     return relationships
 
 
-def extract_executive_officers_from_tables(soup: BeautifulSoup) -> list[PersonRelationship]:
+def extract_executive_officers_from_tables(soup: BeautifulSoup, source: str = "item_10") -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
     for table in soup.find_all("table"):
         table_text = clean_text(table.get_text(" "))
@@ -718,11 +719,11 @@ def extract_executive_officers_from_tables(soup: BeautifulSoup) -> list[PersonRe
                 continue
             title = " ".join(cell for idx, cell in enumerate(row) if idx != name_index)
             for relationship_type in title_to_relationships(title + " executive officer"):
-                relationships.append(PersonRelationship(name, relationship_type))
+                relationships.append(PersonRelationship(name, relationship_type, source))
     return relationships
 
 
-def extract_executive_officers_from_text(text: str) -> list[PersonRelationship]:
+def extract_executive_officers_from_text(text: str, source: str = "item_10") -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
     officer_sections = extract_context_sections(text, EXECUTIVE_OFFICER_CONTEXT_RE, window=5000)
     if not officer_sections:
@@ -738,13 +739,13 @@ def extract_executive_officers_from_text(text: str) -> list[PersonRelationship]:
             continue
         title = clean_text(match.group(2))
         for relationship_type in title_to_relationships(title):
-            relationships.append(PersonRelationship(name, relationship_type))
+            relationships.append(PersonRelationship(name, relationship_type, source))
     return relationships
 
 
-def extract_executive_officers(soup: BeautifulSoup, text: str) -> list[PersonRelationship]:
-    relationships = extract_executive_officers_from_tables(soup)
-    relationships.extend(extract_executive_officers_from_text(text))
+def extract_executive_officers(soup: BeautifulSoup, text: str, source: str = "item_10") -> list[PersonRelationship]:
+    relationships = extract_executive_officers_from_tables(soup, source=source)
+    relationships.extend(extract_executive_officers_from_text(text, source=source))
     return dedupe_relationships(relationships)
 
 
@@ -806,7 +807,9 @@ def signature_candidate_names(text: str) -> list[str]:
     return names
 
 
-def relationships_from_signature_name_and_title(name: str, title: str) -> list[PersonRelationship]:
+def relationships_from_signature_name_and_title(
+    name: str, title: str, source: str = "signature_free_text"
+) -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
     if not is_plausible_person_name(name, log_rejection=True, context="signature_relationship_candidate"):
         return relationships
@@ -815,13 +818,13 @@ def relationships_from_signature_name_and_title(name: str, title: str) -> list[P
         # Signature pages identify the legal signers. Keep CEO/CFO precise and
         # do not broaden every president/VP signer into an executive-officer edge.
         if relationship_type in {"CEO_OF", "CFO_OF"}:
-            relationships.append(PersonRelationship(name, relationship_type))
+            relationships.append(PersonRelationship(name, relationship_type, source))
     if "principal executive officer" in title_lower and not any(rel.relationship_type == "CEO_OF" for rel in relationships):
-        relationships.append(PersonRelationship(name, "CEO_OF"))
+        relationships.append(PersonRelationship(name, "CEO_OF", source))
     if "principal financial officer" in title_lower and not any(rel.relationship_type == "CFO_OF" for rel in relationships):
-        relationships.append(PersonRelationship(name, "CFO_OF"))
+        relationships.append(PersonRelationship(name, "CFO_OF", source))
     if re.search(r"\bdirector\b", title, re.I):
-        relationships.append(PersonRelationship(name, "BOARD_OF"))
+        relationships.append(PersonRelationship(name, "BOARD_OF", source))
     return relationships
 
 
@@ -844,7 +847,7 @@ def extract_signature_relationships_from_text(signature_text: str) -> list[Perso
             name = after_names[0] if after_names else ""
         if not name:
             continue
-        relationships.extend(relationships_from_signature_name_and_title(name, title_context))
+        relationships.extend(relationships_from_signature_name_and_title(name, title_context, source="signature_free_text"))
     return dedupe_relationships(relationships)
 
 
@@ -991,7 +994,7 @@ def extract_signature_relationships_from_table(table) -> list[PersonRelationship
             name = extract_signature_name_from_cell(row[row_signature_idx])
             if not name:
                 continue
-            relationships.extend(relationships_from_signature_name_and_title(name, title))
+            relationships.extend(relationships_from_signature_name_and_title(name, title, source="signature_table"))
     return dedupe_relationships(relationships)
 
 
@@ -1020,7 +1023,7 @@ def format_debug_relationships(relationships: Iterable[PersonRelationship]) -> s
     rels = list(relationships)
     if not rels:
         return "[]"
-    return ", ".join(f"{rel.name} -> {rel.relationship_type}" for rel in rels)
+    return ", ".join(f"{rel.name} -> {rel.relationship_type} [source={rel.source}]" for rel in rels)
 
 
 def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("data")) -> None:
@@ -1119,10 +1122,39 @@ def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("da
 
     lines.append("5. Relationships emitted from each pairing")
     for name, title, table_index, row_index, _signature_idx in pairings:
-        emitted = relationships_from_signature_name_and_title(name, title)
+        emitted = relationships_from_signature_name_and_title(name, title, source="signature_table")
         lines.append(f"  Table {table_index} row {row_index}: {name} => {format_debug_relationships(emitted)}")
     if not pairings:
         lines.append("  No table relationships emitted.")
+    lines.append("")
+
+    lines.append("6. Final relationships emitted by extractor source")
+    extraction = parse_filing_with_sources(html)
+    for rel in extraction.relationships:
+        lines.append(f"  {rel.name} -> {rel.relationship_type} [source={rel.source}]")
+    if not extraction.relationships:
+        lines.append("  No relationships emitted.")
+    lines.append("")
+
+    tracked_targets = {
+        "QRVO": [("Robert Bruggeworth", "CFO_OF")],
+        "OLED": [("Steven Abramson", "CFO_OF")],
+        "COHR": [("Officer Pursuant", "CFO_OF"), ("R Anderson", "CFO_OF")],
+    }
+    normalized_ticker = normalize_ticker(ticker)
+    if normalized_ticker in tracked_targets:
+        lines.append("7. Requested CFO edge source trace")
+        for target_name, target_type in tracked_targets[normalized_ticker]:
+            matches = [
+                rel
+                for rel in extraction.relationships
+                if rel.relationship_type == target_type and canonical_name(rel.name) == canonical_name(target_name)
+            ]
+            if matches:
+                for rel in matches:
+                    lines.append(f"  {target_name} -> {target_type}: emitted by {rel.source} as {rel.name}")
+            else:
+                lines.append(f"  {target_name} -> {target_type}: not emitted")
 
     debug_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1134,16 +1166,16 @@ def extract_signature_relationships(soup: BeautifulSoup, full_text: str) -> list
     return extract_signature_relationships_from_text(signature_text)
 
 
-def extract_officers(text: str) -> list[PersonRelationship]:
+def extract_officers(text: str, source: str = "fallback") -> list[PersonRelationship]:
     relationships: list[PersonRelationship] = []
     ceo_title = r"(?:President\s+and\s+)?Chief\s+Executive\s+Officer|CEO"
     cfo_title = r"Chief\s+Financial\s+Officer|CFO"
     ceo = most_common_name(extract_name_before_title(text, ceo_title) + extract_name_after_title(text, ceo_title))
     cfo = most_common_name(extract_name_before_title(text, cfo_title) + extract_name_after_title(text, cfo_title))
     if ceo:
-        relationships.append(PersonRelationship(ceo, "CEO_OF"))
+        relationships.append(PersonRelationship(ceo, "CEO_OF", source))
     if cfo and canonical_name(cfo) != canonical_name(ceo or ""):
-        relationships.append(PersonRelationship(cfo, "CFO_OF"))
+        relationships.append(PersonRelationship(cfo, "CFO_OF", source))
     return relationships
 
 
@@ -1232,15 +1264,15 @@ def parse_item_10_relationships(soup: BeautifulSoup, full_text: str) -> list[Per
     # place the executive-officer table in Part I and cross-reference it from Item 10,
     # so executive-officer extraction may use the full 10-K text while still staying
     # within the single 10-K source.
-    relationships = extract_officers(item_10_or_full_text)
-    relationships.extend(extract_executive_officers(soup, full_text))
+    relationships = extract_officers(item_10_or_full_text, source="item_10")
+    relationships.extend(extract_executive_officers(soup, full_text, source="item_10"))
 
     item_10_soup = BeautifulSoup(item_10_text, "lxml") if item_10_text else soup
     board_names = dedupe_names(extract_board_from_tables(item_10_soup) + extract_board_from_text(item_10_or_full_text))
     officer_keys = {canonical_name(rel.name) for rel in relationships}
     for name in board_names:
         if canonical_name(name) in officer_keys or is_plausible_person_name(name):
-            relationships.append(PersonRelationship(name, "BOARD_OF"))
+            relationships.append(PersonRelationship(name, "BOARD_OF", "item_10"))
     return dedupe_relationships(relationships)
 
 
@@ -1295,7 +1327,7 @@ def dedupe_relationships(relationships: Iterable[PersonRelationship]) -> list[Pe
         if not key[0] or key in seen:
             continue
         seen.add(key)
-        deduped.append(PersonRelationship(name=name, relationship_type=rel.relationship_type))
+        deduped.append(PersonRelationship(name=name, relationship_type=rel.relationship_type, source=rel.source))
     return deduped
 
 
@@ -1387,6 +1419,7 @@ def write_outputs(
             "ticker",
             "filing_date",
             "filing_url",
+            "relationship_source",
         ],
     )
     log_df = pd.DataFrame(
@@ -1601,6 +1634,7 @@ def main() -> int:
                     "ticker": company.ticker,
                     "filing_date": filing.filing_date,
                     "filing_url": filing.filing_url,
+                    "relationship_source": rel.source,
                 }
             )
         parse_log.append(
