@@ -339,6 +339,13 @@ def parse_args() -> argparse.Namespace:
             "extraction, fallback, and merge logic."
         ),
     )
+    parser.add_argument(
+        "--debug-signature-tickers",
+        help=(
+            "Comma-separated tickers for signature extraction debug logs. Writes "
+            "data/debug_<ticker>.log files."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1008,6 +1015,117 @@ def extract_signature_relationships_from_tables(soup: BeautifulSoup) -> list[Per
     return dedupe_relationships(relationships)
 
 
+
+def format_debug_relationships(relationships: Iterable[PersonRelationship]) -> str:
+    rels = list(relationships)
+    if not rels:
+        return "[]"
+    return ", ".join(f"{rel.name} -> {rel.relationship_type}" for rel in rels)
+
+
+def write_signature_debug_log(ticker: str, html: str, debug_dir: Path = Path("data")) -> None:
+    """Write an observation-only log for the existing SEC signature extraction path."""
+    soup = BeautifulSoup(html, "html.parser")
+    debug_path = debug_dir / f"debug_{ticker}.log"
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = [
+        f"Signature extraction debug log for {ticker}",
+        "",
+        "This log is observation-only and does not change extraction behavior.",
+        "",
+    ]
+
+    anchored_tables = tables_after_signature_anchor(soup)
+    lines.append("1. Raw table rows detected after the Exchange Act anchor")
+    if not anchored_tables:
+        lines.append("  No tables detected after the Exchange Act anchor.")
+    for table_index, table in enumerate(anchored_tables, start=1):
+        rows = table_rows_with_cell_lines(table)
+        lines.append(f"  Table {table_index}: {len(rows)} row(s)")
+        for row_index, row in enumerate(rows, start=1):
+            cells = [" | ".join(cell) for cell in row]
+            lines.append(f"    Row {row_index}: {cells}")
+    lines.append("")
+
+    lines.append("2. Detected signer candidates")
+    candidate_tables = anchored_tables or list(soup.find_all("table"))
+    anchored_table_ids = {id(table) for table in anchored_tables}
+    any_candidate_table = False
+    for table_index, table in enumerate(candidate_tables, start=1):
+        table_text = clean_text(table.get_text(" "))
+        lower = table_text.lower()
+        if id(table) not in anchored_table_ids and not ("/s/" in table_text or "signature" in lower):
+            continue
+        any_candidate_table = True
+        rows = table_rows_with_cell_lines(table)
+        column_pairs, first_data_row = signature_table_column_pairs(rows)
+        for row_index, row in enumerate(rows[first_data_row:], start=first_data_row + 1):
+            row_pairs = column_pairs or infer_signature_table_index_pairs(row)
+            for signature_idx, _title_idx in row_pairs:
+                if signature_idx < len(row):
+                    name = extract_signature_name_from_cell(row[signature_idx])
+                    lines.append(
+                        f"  Table {table_index} row {row_index} cell {signature_idx}: "
+                        f"{name or '[none]'} from {row[signature_idx]}"
+                    )
+    if not any_candidate_table:
+        lines.append("  No candidate signature tables evaluated.")
+    lines.append("")
+
+    lines.append("3. Detected title candidates")
+    for table_index, table in enumerate(candidate_tables, start=1):
+        table_text = clean_text(table.get_text(" "))
+        lower = table_text.lower()
+        if id(table) not in anchored_table_ids and not ("/s/" in table_text or "signature" in lower):
+            continue
+        rows = table_rows_with_cell_lines(table)
+        column_pairs, first_data_row = signature_table_column_pairs(rows)
+        for row_index, row in enumerate(rows[first_data_row:], start=first_data_row + 1):
+            row_pairs = column_pairs or infer_signature_table_index_pairs(row)
+            for _signature_idx, title_idx in row_pairs:
+                if title_idx < len(row):
+                    title = flatten_signature_cell_lines(row[title_idx])
+                    marker = "MATCH" if SIGNATURE_TITLE_RE.search(title) else "NO_MATCH"
+                    lines.append(f"  Table {table_index} row {row_index} cell {title_idx}: {marker}: {title}")
+    lines.append("")
+
+    lines.append("4. Name-title pairings before relationship creation")
+    pairings: list[tuple[str, str, int, int, int]] = []
+    for table_index, table in enumerate(candidate_tables, start=1):
+        table_text = clean_text(table.get_text(" "))
+        lower = table_text.lower()
+        if id(table) not in anchored_table_ids and not ("/s/" in table_text or "signature" in lower):
+            continue
+        rows = table_rows_with_cell_lines(table)
+        if not rows or SIGNATURE_TITLE_RE.search(table_text) is None:
+            continue
+        column_pairs, first_data_row = signature_table_column_pairs(rows)
+        for row_index, row in enumerate(rows[first_data_row:], start=first_data_row + 1):
+            row_pairs = column_pairs or infer_signature_table_index_pairs(row)
+            for signature_idx, title_idx in row_pairs:
+                if signature_idx >= len(row) or title_idx >= len(row):
+                    continue
+                title = flatten_signature_cell_lines(row[title_idx])
+                if not SIGNATURE_TITLE_RE.search(title):
+                    continue
+                name = extract_signature_name_from_cell(row[signature_idx])
+                if not name:
+                    continue
+                pairings.append((name, title, table_index, row_index, signature_idx))
+                lines.append(f"  Table {table_index} row {row_index}: {name} => {title}")
+    if not pairings:
+        lines.append("  No table pairings reached relationship creation.")
+    lines.append("")
+
+    lines.append("5. Relationships emitted from each pairing")
+    for name, title, table_index, row_index, _signature_idx in pairings:
+        emitted = relationships_from_signature_name_and_title(name, title)
+        lines.append(f"  Table {table_index} row {row_index}: {name} => {format_debug_relationships(emitted)}")
+    if not pairings:
+        lines.append("  No table relationships emitted.")
+
+    debug_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 def extract_signature_relationships(soup: BeautifulSoup, full_text: str) -> list[PersonRelationship]:
     table_relationships = extract_signature_relationships_from_tables(soup)
     if table_relationships:
@@ -1347,6 +1465,9 @@ def main() -> int:
         )
 
     tickers, universe_source = get_universe(args.tickers, args.limit, args.user_agent, cache_dir)
+    debug_signature_tickers = {
+        normalize_ticker(ticker) for ticker in (args.debug_signature_tickers or "").split(",") if ticker.strip()
+    }
     print(f"Universe source: {universe_source}")
     print(f"SOXX tickers queued: {len(tickers)}")
     if args.signature_only:
@@ -1417,6 +1538,8 @@ def main() -> int:
         cache_path = filings_cache_dir / ticker / f"{filing.accession.replace('-', '')}_{filing.primary_document}"
         try:
             html = client.download_text_cached(filing.filing_url, cache_path)
+            if ticker in debug_signature_tickers:
+                write_signature_debug_log(ticker, html)
             extraction = parse_filing_with_sources(html, signature_only=args.signature_only)
             relationships = [
                 rel
