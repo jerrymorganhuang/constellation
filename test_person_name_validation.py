@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 
@@ -8,6 +10,7 @@ from build_constellation_soxx import (
     is_plausible_person_name,
     parse_filing_with_sources,
     person_name_rejection_reason,
+    write_signature_debug_log,
 )
 
 
@@ -218,6 +221,36 @@ class StrictPersonNameValidatorTest(unittest.TestCase):
         )
         self.assertNotIn(("Officer Pursuant", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
         self.assertNotIn(("R Anderson", "CFO_OF"), [(rel.name, rel.relationship_type) for rel in extraction.relationships])
+
+    def test_signature_debug_log_records_pairings_without_changing_extraction(self):
+        html = """<html><body><h1>SIGNATURES</h1>
+        <p>Pursuant to the requirements of the Securities Exchange Act of 1934,
+        this report has been signed below by the following persons.</p>
+        <table>
+          <tr><th>Signature</th><th>Title</th><th>Signature</th><th>Title</th></tr>
+          <tr>
+            <td>/s/ Robert A. Bruggeworth<br>Robert A. Bruggeworth</td>
+            <td>President and Chief Executive Officer and Director</td>
+            <td>/s/ Grant Brown<br>Grant Brown</td>
+            <td>Chief Financial Officer</td>
+          </tr>
+        </table>
+        </body></html>"""
+
+        before = parse_filing_with_sources(html, signature_only=True).relationships
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_signature_debug_log("QRVO", html, Path(tmpdir))
+            debug_text = (Path(tmpdir) / "debug_QRVO.log").read_text(encoding="utf-8")
+        after = parse_filing_with_sources(html, signature_only=True).relationships
+
+        self.assertEqual(before, after)
+        self.assertIn("1. Raw table rows detected after the Exchange Act anchor", debug_text)
+        self.assertIn("2. Detected signer candidates", debug_text)
+        self.assertIn("3. Detected title candidates", debug_text)
+        self.assertIn("4. Name-title pairings before relationship creation", debug_text)
+        self.assertIn("5. Relationships emitted from each pairing", debug_text)
+        self.assertIn("Robert A Bruggeworth => Robert A Bruggeworth -> CEO_OF", debug_text)
+        self.assertIn("Grant Brown => Grant Brown -> CFO_OF", debug_text)
 
 
 if __name__ == "__main__":
