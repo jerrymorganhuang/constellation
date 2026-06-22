@@ -6,11 +6,11 @@ The goal is to build a lightweight investor research tool that allows users to s
 
 ## V0 Scope
 
-The first validation scope is SOXX constituents only.
+The first validation scope was SOXX constituents. The same signature-page extraction path can now also run against an explicit universe CSV, including the checked-in Nasdaq 100 universe at `data/universes/nasdaq100.csv`.
 
 V0 is implemented as a standalone Python pipeline that:
 
-- maps tickers to SEC CIKs
+- maps tickers to SEC CIKs, or reads ticker/company/CIK values from a universe CSV
 - retrieves the latest 10-K annual report filing only
 - downloads and caches filing HTML
 - parses the 10-K signature page as the primary source for CEO, CFO, and director relationships
@@ -27,16 +27,27 @@ Install the Python dependencies, set a SEC-compliant User-Agent, and run the scr
 ```bash
 python -m pip install -r requirements.txt
 export CONSTELLATION_SEC_USER_AGENT="ConstellationV0 research@example.com"
-python build_constellation_soxx.py
+python build_constellation_soxx.py --signature-only --output-dir data/test_soxx_signature_only
 ```
 
-The script writes all V0 outputs under `data/constellation_v0/`:
+The legacy default still uses the SOXX universe when `--universe-csv` is omitted. The command above writes the validated SOXX signature-page-only output under `data/test_soxx_signature_only/`.
 
 - `company_nodes.csv`
 - `person_nodes.csv`
 - `edges.csv`
 - `parse_log.csv` with signature-page vs. Item 10 extraction counts and success flags
+- `qa_summary.csv` with aggregate coverage counts
+- `qa_low_coverage.csv` with companies that need review
 - `cache/` for downloaded SEC and universe files
+
+Run the checked-in Nasdaq 100 CSV universe with the same signature-page extraction logic:
+
+```bash
+python build_constellation_soxx.py \
+  --universe-csv data/universes/nasdaq100.csv \
+  --signature-only \
+  --output-dir data/test_nasdaq100_signature_only
+```
 
 Useful development options:
 
@@ -45,6 +56,7 @@ python build_constellation_soxx.py --tickers NVDA,AMD
 python build_constellation_soxx.py --limit 5
 python build_constellation_soxx.py --output-dir /tmp/constellation_v0_test
 python build_constellation_soxx.py --signature-only
+python build_constellation_soxx.py --universe-csv data/universes/nasdaq100.csv --tickers NVDA,AMD,AAPL --signature-only --output-dir /tmp/constellation_nasdaq100_smoke
 ```
 
 ## Graph Model
@@ -93,7 +105,8 @@ Edge fields:
 
 - Use SEC EDGAR 10-K annual report filings as the only V0 filing source
 - Prefer precision-first 10-K signature-page rows for CEO, CFO, and director extraction before Item 10 fallback rows
-- Use `--signature-only` for temporary validation runs that output only signature-page relationships and skip Item 10 extraction, fallback, and merge logic
+- Use `--signature-only` for validation runs that output only signature-page relationships and skip Item 10 extraction, fallback, and merge logic
+- Use `--universe-csv` to run the same extraction logic against any CSV with `ticker`, `company_name`, and `cik` columns
 - Use the latest 10-K filing for each company
 - Keep SEC User-Agent handling and local filing cache
 - Keep the V0 outputs as `company_nodes.csv`, `person_nodes.csv`, `edges.csv`, and `parse_log.csv`
@@ -122,11 +135,22 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Load the current validated signature-page-only CSV output:
+Load the current validated SOXX signature-page-only CSV output:
 
 ```bash
 python load_neo4j.py \
   --input-dir data/test_soxx_signature_only \
+  --uri bolt://localhost:7687 \
+  --user neo4j \
+  --password constellation123 \
+  --clear
+```
+
+Load the Nasdaq 100 signature-page-only CSV output:
+
+```bash
+python load_neo4j.py \
+  --input-dir data/test_nasdaq100_signature_only \
   --uri bolt://localhost:7687 \
   --user neo4j \
   --password constellation123 \
@@ -163,3 +187,7 @@ MATCH (p:Person)-[r]->(c:Company)
 WHERE toLower(p.name) CONTAINS toLower("Victor Peng")
 RETURN p,r,c;
 ```
+
+## QA Output Interpretation
+
+Each extraction run writes two lightweight QA files next to the graph CSVs. `qa_summary.csv` reports total companies, total people, total relationships, `CEO_OF`, `CFO_OF`, and `BOARD_OF` counts, plus counts of companies flagged for low coverage. `qa_low_coverage.csv` lists companies where total relationships are below 5, the CEO edge is missing, the CFO edge is missing, or fewer than 5 board members were extracted. These QA flags are review cues for signature-page coverage; they do not change the edge schema consumed by `load_neo4j.py`.
