@@ -23,7 +23,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Load Constellation V0 CSV outputs into Neo4j."
     )
-    parser.add_argument("--input-dir", default=DEFAULT_INPUT_DIR)
+    parser.add_argument(
+        "--input-dir", "--data-dir", dest="input_dir", default=DEFAULT_INPUT_DIR
+    )
     parser.add_argument("--uri", default=DEFAULT_URI)
     parser.add_argument("--user", default=DEFAULT_USER)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)

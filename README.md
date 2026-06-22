@@ -191,3 +191,74 @@ RETURN p,r,c;
 ## QA Output Interpretation
 
 Each extraction run writes two lightweight QA files next to the graph CSVs. `qa_summary.csv` reports total companies, total people, total relationships, `CEO_OF`, `CFO_OF`, and `BOARD_OF` counts, plus counts of companies flagged for low coverage. `qa_low_coverage.csv` lists companies where total relationships are below 5, the CEO edge is missing, the CFO edge is missing, or fewer than 5 board members were extracted. These QA flags are review cues for signature-page coverage; they do not change the edge schema consumed by `load_neo4j.py`.
+
+## Web App V1
+
+Constellation Web App V1 adds a product-shaped graph explorer on top of the existing Layer 1 CSV output and Layer 2 Neo4j loader. The default landing view intentionally loads the full universal graph for the loaded universe so users can inspect the complete network before narrowing to cross-company or local-focus views.
+
+### Load Nasdaq 100 into Neo4j
+
+Start Neo4j locally, then load the checked-in Nasdaq 100 signature-page output:
+
+```bash
+python3 load_neo4j.py --clear --data-dir data/test_nasdaq100_signature_only
+```
+
+The loader also accepts explicit connection flags when your Neo4j instance is not using local defaults:
+
+```bash
+python3 load_neo4j.py \
+  --clear \
+  --data-dir data/test_nasdaq100_signature_only \
+  --uri bolt://localhost:7687 \
+  --user neo4j \
+  --password "$NEO4J_PASSWORD"
+```
+
+Do not commit Neo4j credentials. The web backend reads its password from environment variables.
+
+### Start the FastAPI backend
+
+Install backend dependencies and export Neo4j connection settings:
+
+```bash
+python3 -m pip install -r app/backend/requirements.txt
+export NEO4J_URI="bolt://localhost:7687"
+export NEO4J_USER="neo4j"
+export NEO4J_PASSWORD="your-local-password"
+uvicorn app.backend.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Available API endpoints:
+
+- `GET /health`
+- `GET /graph/universal`
+- `GET /search?q=`
+- `GET /graph/company/{ticker}?radius=1`
+- `GET /graph/person/{name}?radius=1`
+- `GET /graph/cross-company`
+- `GET /graph/company-network`
+
+Graph endpoints return Cytoscape-compatible JSON with `nodes` and `edges` arrays.
+
+### Start the React frontend
+
+Install frontend dependencies and start Vite:
+
+```bash
+cd app/frontend
+npm install
+npm run dev
+```
+
+Open the web app at `http://localhost:5173`. The frontend calls `http://localhost:8000` by default. To use a different API URL, set `VITE_API_BASE_URL` before starting Vite.
+
+### Web App Features
+
+- Full Graph tab loads `GET /graph/universal` automatically on page load.
+- Cross-company tab shows people connected to more than one company.
+- Company Network tab shows derived company-to-company edges with `shared_people` and `shared_count` metadata.
+- Search finds companies by ticker or company name and people by name without replacing the full graph.
+- Search results can focus the current graph node or explicitly load a local Search Focus graph.
+- Left-panel filters toggle `CEO_OF`, `CFO_OF`, `BOARD_OF`, Company nodes, and Person nodes.
+- Clicking a node or edge opens its raw details in the right panel.
