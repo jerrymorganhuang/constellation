@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Constellation V0 SEC-to-graph CSVs for SOXX constituents.
+"""Build Constellation V0 SEC-to-graph CSVs for SOXX or CSV universes.
 
 This standalone pipeline:
 - fetches the current SOXX holdings universe,
@@ -323,9 +323,16 @@ class SecClient:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Constellation V0 SOXX SEC graph CSVs.")
+    parser = argparse.ArgumentParser(description="Build Constellation V0 SEC graph CSVs for SOXX or a CSV universe.")
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Output directory for CSVs and cache.")
     parser.add_argument("--tickers", help="Comma-separated ticker override for targeted runs.")
+    parser.add_argument(
+        "--universe-csv",
+        help=(
+            "Optional universe CSV with ticker, company_name, and cik columns. "
+            "When omitted, the legacy SOXX universe workflow is used."
+        ),
+    )
     parser.add_argument("--limit", type=int, help="Limit the number of companies processed.")
     parser.add_argument(
         "--user-agent",
@@ -393,6 +400,31 @@ def fetch_soxx_tickers(user_agent: str, cache_dir: Path) -> tuple[list[str], str
             print(f"Warning: failed to fetch live SOXX holdings ({exc}); using cached holdings.", file=sys.stderr)
             return parse_soxx_holdings_csv(cache_path.read_text(encoding="utf-8", errors="replace")), "cached_ishares_soxx_holdings_csv"
         raise
+
+
+def read_universe_csv(path: Path) -> list[Company]:
+    """Read an explicit ticker universe CSV without changing SEC parsing behavior."""
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    required = {"ticker", "company_name", "cik"}
+    missing = required - set(rows[0].keys() if rows else [])
+    if missing:
+        raise ValueError(f"Universe CSV {path} is missing columns: {sorted(missing)}")
+    companies: list[Company] = []
+    seen: set[str] = set()
+    for row in rows:
+        ticker = normalize_ticker(row.get("ticker", ""))
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        companies.append(
+            Company(
+                ticker=ticker,
+                cik=str(row.get("cik", "")).strip(),
+                company_name=clean_text(row.get("company_name", "")),
+            )
+        )
+    return companies
 
 
 def get_universe(ticker_override: str | None, limit: int | None, user_agent: str, cache_dir: Path) -> tuple[list[str], str]:
@@ -1546,6 +1578,77 @@ def configure_rejection_logging(output_dir: Path) -> None:
         LOGGER.addHandler(handler)
 
 
+def write_qa_outputs(
+    output_dir: Path,
+    company_df: pd.DataFrame,
+    person_df: pd.DataFrame,
+    edge_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Write lightweight coverage QA files for extraction outputs."""
+    relationship_counts = Counter(edge_df.get("relationship_type", []))
+    rows_by_ticker: dict[str, list[dict[str, str]]] = {ticker: [] for ticker in company_df.get("ticker", [])}
+    for row in edge_df.to_dict("records"):
+        rows_by_ticker.setdefault(row.get("ticker", ""), []).append(row)
+
+    low_rows: list[dict[str, str]] = []
+    for company in company_df.to_dict("records"):
+        ticker = company.get("ticker", "")
+        rows = rows_by_ticker.get(ticker, [])
+        counts = Counter(row.get("relationship_type", "") for row in rows)
+        total = len(rows)
+        ceo_missing = counts["CEO_OF"] == 0
+        cfo_missing = counts["CFO_OF"] == 0
+        board_below_threshold = counts["BOARD_OF"] < 5
+        low_coverage = total < 5
+        if low_coverage or ceo_missing or cfo_missing or board_below_threshold:
+            low_rows.append(
+                {
+                    "ticker": ticker,
+                    "company_name": company.get("company_name", ""),
+                    "total_relationships": str(total),
+                    "ceo_count": str(counts["CEO_OF"]),
+                    "cfo_count": str(counts["CFO_OF"]),
+                    "board_count": str(counts["BOARD_OF"]),
+                    "low_coverage": "yes" if low_coverage else "no",
+                    "ceo_missing": "yes" if ceo_missing else "no",
+                    "cfo_missing": "yes" if cfo_missing else "no",
+                    "board_count_below_5": "yes" if board_below_threshold else "no",
+                }
+            )
+
+    summary_rows = [
+        {"metric": "total_companies", "value": str(len(company_df))},
+        {"metric": "total_people", "value": str(len(person_df))},
+        {"metric": "total_relationships", "value": str(len(edge_df))},
+        {"metric": "CEO_OF_count", "value": str(relationship_counts["CEO_OF"])},
+        {"metric": "CFO_OF_count", "value": str(relationship_counts["CFO_OF"])},
+        {"metric": "BOARD_OF_count", "value": str(relationship_counts["BOARD_OF"])},
+        {"metric": "low_coverage_companies", "value": str(sum(1 for row in low_rows if row["low_coverage"] == "yes"))},
+        {"metric": "CEO_missing_companies", "value": str(sum(1 for row in low_rows if row["ceo_missing"] == "yes"))},
+        {"metric": "CFO_missing_companies", "value": str(sum(1 for row in low_rows if row["cfo_missing"] == "yes"))},
+        {"metric": "board_count_below_5_companies", "value": str(sum(1 for row in low_rows if row["board_count_below_5"] == "yes"))},
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=["metric", "value"])
+    low_df = pd.DataFrame(
+        low_rows,
+        columns=[
+            "ticker",
+            "company_name",
+            "total_relationships",
+            "ceo_count",
+            "cfo_count",
+            "board_count",
+            "low_coverage",
+            "ceo_missing",
+            "cfo_missing",
+            "board_count_below_5",
+        ],
+    )
+    summary_df.to_csv(output_dir / "qa_summary.csv", index=False)
+    low_df.to_csv(output_dir / "qa_low_coverage.csv", index=False)
+    return summary_df, low_df
+
+
 def write_outputs(
     output_dir: Path,
     companies: list[Company],
@@ -1679,16 +1782,32 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    tickers, universe_source = get_universe(args.tickers, args.limit, args.user_agent, cache_dir)
+    universe_companies: list[Company] | None = None
+    if args.universe_csv:
+        universe_companies = read_universe_csv(Path(args.universe_csv))
+        if args.tickers:
+            ticker_filter = {normalize_ticker(ticker) for ticker in args.tickers.split(",") if ticker.strip()}
+            universe_companies = [company for company in universe_companies if company.ticker in ticker_filter]
+        if args.limit is not None:
+            universe_companies = universe_companies[: args.limit]
+        tickers = [company.ticker for company in universe_companies]
+        universe_source = f"csv:{args.universe_csv}"
+    else:
+        tickers, universe_source = get_universe(args.tickers, args.limit, args.user_agent, cache_dir)
     debug_signature_tickers = {
         normalize_ticker(ticker) for ticker in (args.debug_signature_tickers or "").split(",") if ticker.strip()
     }
     print(f"Universe source: {universe_source}")
-    print(f"SOXX tickers queued: {len(tickers)}")
+    print(f"Tickers queued: {len(tickers)}")
     if args.signature_only:
         print("Signature-only validation mode: Item 10 extraction, fallback, and merge are disabled.")
 
-    ticker_map = fetch_sec_ticker_map(client, cache_dir)
+    universe_company_map = {company.ticker: company for company in universe_companies or []}
+    needs_sec_ticker_map = universe_companies is None or any(not company.cik for company in universe_companies)
+    ticker_map = fetch_sec_ticker_map(client, cache_dir) if needs_sec_ticker_map else {}
+    for universe_company in universe_company_map.values():
+        if universe_company.cik:
+            ticker_map[universe_company.ticker] = universe_company
     companies: list[Company] = []
     edges: list[dict[str, str]] = []
     parse_log: list[dict[str, str]] = []
@@ -1844,6 +1963,7 @@ def main() -> int:
     edges = sorted(unique_edges.values(), key=lambda row: (row["ticker"], row["relationship_type"], row["source_person"]))
 
     company_df, person_df, edge_df, _ = write_outputs(output_dir, companies, edges, parse_log)
+    write_qa_outputs(output_dir, company_df, person_df, edge_df)
     print_summary(
         companies_processed=len(tickers),
         filings_found=filings_found,
@@ -1857,6 +1977,7 @@ def main() -> int:
         signature_only=args.signature_only,
     )
     print(f"\nCSV outputs saved under: {output_dir}")
+    print(f"QA outputs saved under: {output_dir / 'qa_summary.csv'} and {output_dir / 'qa_low_coverage.csv'}")
     return 0
 
 
