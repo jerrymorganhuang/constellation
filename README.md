@@ -12,9 +12,9 @@ The Company Master module builds the primary company reference store at `data/co
 
 Repository policy for generated files:
 
-- Commit source code, documentation, dependency manifests, and stable source inputs such as `data/universes/*.csv`.
+- Commit source code, documentation, dependency manifests, and documented source metadata such as `data/universes/sources.yml`.
 - Do not commit generated SQLite databases, CSV exports, caches, or local virtual environments.
-- Regenerate `data/constellation.db` and `data/companies.csv` locally with `python scripts/build_companies.py` when needed.
+- Regenerate `data/constellation.db`, `data/companies.csv`, and `data/universe_audit.json` locally with `python scripts/build_companies.py` when needed.
 
 Run the builder from the repository root:
 
@@ -22,7 +22,7 @@ Run the builder from the repository root:
 python scripts/build_companies.py
 ```
 
-The script fetches universe membership from rule-based public sources, enriches company name, sector, industry, and description with `yfinance`, rebuilds the `companies` table in SQLite, exports `data/companies.csv`, and validates the generated outputs. Missing yfinance metadata is left blank/null.
+The script fetches universe membership from documented rule-based public sources in `data/universes/sources.yml`, enriches company name, sector, industry, and description with `yfinance`, derives a deterministic short description, rebuilds the `companies` table in SQLite, exports `data/companies.csv`, writes `data/universe_audit.json`, and validates the generated outputs. Missing yfinance metadata is left blank/null. Source fetch failures are reported as skipped universes; the build completes as long as at least one universe is loaded and never falls back to undocumented local universe files.
 
 SQLite schema:
 
@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS companies (
     sector TEXT,
     industry TEXT,
     description TEXT,
+    description_short TEXT,
     updated_at TEXT NOT NULL
 );
 ```
@@ -41,7 +42,7 @@ CREATE TABLE IF NOT EXISTS companies (
 CSV schema:
 
 ```csv
-ticker,company_name,universe,sector,industry,description,updated_at
+ticker,company_name,universe,sector,industry,description,description_short,updated_at
 ```
 
 ## V0 Scope
