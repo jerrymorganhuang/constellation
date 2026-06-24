@@ -24,6 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pandas as pd
+from bs4 import BeautifulSoup
 
 try:
     import yfinance as yf
@@ -270,15 +271,30 @@ def fetch_ndx() -> UniverseResult:
     response = _download_with_retries(NDX_URL, timeout=180, attempts=4, label="NDX")
     html = response.content
     resolved_url = response.final_url
-    tables = pd.read_html(io.BytesIO(html))
+    html_text = html.decode("utf-8", errors="replace")
+    discovered_headers: list[list[str]] = []
+    try:
+        tables = pd.read_html(io.BytesIO(html))
+    except ValueError:
+        tables = []
     for table in tables:
+        discovered_headers.append([str(column) for column in table.columns])
         columns = {str(column).strip().lower(): column for column in table.columns}
         if "symbol" in columns and "company name" in columns:
             tickers = {ticker for ticker in (normalize_ticker(v) for v in table[columns["symbol"]].tolist()) if ticker}
             if tickers:
-                last_updated = _extract_last_updated_text(html.decode("utf-8", errors="replace"))
+                last_updated = _extract_last_updated_text(html_text)
                 return UniverseResult(tickers, resolved_url=resolved_url, notes=last_updated)
-    raise RuntimeError("Nasdaq-100 static HTML table with Symbol and Company Name columns was not found")
+    tickers = _extract_ndx_with_beautifulsoup(html_text)
+    if tickers:
+        last_updated = _extract_last_updated_text(html_text)
+        return UniverseResult(tickers, resolved_url=resolved_url, notes=last_updated)
+    discovered_headers.extend(_ndx_table_headers(html_text))
+    debug_path = _write_debug_response("ndx_table_not_found", response)
+    raise RuntimeError(
+        "Nasdaq-100 static HTML table with Symbol and Company Name columns was not found; "
+        f"headers={discovered_headers}; debug={debug_path.relative_to(ROOT_DIR)}"
+    )
 
 
 def _extract_last_updated_text(html: str) -> str | None:
@@ -288,9 +304,49 @@ def _extract_last_updated_text(html: str) -> str | None:
     return None
 
 
+def _normalize_header_text(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _ndx_table_headers(html: str) -> list[list[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    discovered: list[list[str]] = []
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        cells = rows[0].find_all(["th", "td"])
+        discovered.append([re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip() for cell in cells])
+    return discovered
+
+
+def _extract_ndx_with_beautifulsoup(html: str) -> set[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        first_cells = rows[0].find_all(["th", "td"])
+        headers = [_normalize_header_text(cell.get_text(" ", strip=True)) for cell in first_cells]
+        if len(headers) < 2 or headers[0] != "symbol" or headers[1] != "company name":
+            continue
+        tickers: set[str] = set()
+        for row in rows[1:]:
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            ticker = normalize_ticker(cells[0].get_text(" ", strip=True))
+            if ticker:
+                tickers.add(ticker)
+        if tickers:
+            return tickers
+    return set()
+
+
 def _dataframe_tickers(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("ticker", "symbol")) -> set[str]:
-    columns = {str(column).strip().lower(): column for column in df.columns}
-    column = next((columns[name] for name in preferred_columns if name in columns), None)
+    columns = {_normalize_header_text(column): column for column in df.columns}
+    column = next((columns[_normalize_header_text(name)] for name in preferred_columns if _normalize_header_text(name) in columns), None)
     if column is None:
         raise RuntimeError(f"No ticker column found in columns: {list(df.columns)}")
     tickers: set[str] = set()
@@ -306,10 +362,12 @@ def _dataframe_tickers(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("
 def _is_excel_response(response: FetchResponse, url: str) -> bool:
     lower_url = url.lower()
     content_type = response.content_type
+    text_start = response.content[:500].decode("utf-8", errors="replace").lower()
     return (
         lower_url.endswith((".xls", ".xlsx"))
         or response.content[:2] == b"PK"
         or response.content[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        or ("<workbook" in text_start and "spreadsheet" in text_start)
         or "spreadsheet" in content_type
         or "excel" in content_type
         or content_type in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
@@ -317,12 +375,13 @@ def _is_excel_response(response: FetchResponse, url: str) -> bool:
 
 
 def _read_excel_response(content: bytes, preferred_sheet: str | None = None) -> pd.DataFrame:
+    read_kwargs: dict[str, Any] = {"header": None}
     if preferred_sheet:
         try:
-            return pd.read_excel(io.BytesIO(content), sheet_name=preferred_sheet)
+            return pd.read_excel(io.BytesIO(content), sheet_name=preferred_sheet, **read_kwargs)
         except ValueError:
             pass
-    sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+    sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, **read_kwargs)
     if not sheets:
         raise RuntimeError("Excel workbook did not contain readable sheets")
     if preferred_sheet and preferred_sheet.lower() in {name.lower(): name for name in sheets}:
@@ -338,17 +397,51 @@ def _read_delimited_response(content: bytes, required_column: str = "Ticker") ->
     lines = text.splitlines()
     header_idx = _find_csv_header_index(lines, required_column)
     csv_text = "\n".join(lines[header_idx:]) if header_idx is not None else text
-    return pd.read_csv(io.StringIO(csv_text), sep=None, engine="python")
+    return pd.read_csv(io.StringIO(csv_text), sep=None, engine="python", header=None)
 
 
 def _read_tabular_response(response: FetchResponse, url: str, required_column: str = "Ticker", preferred_sheet: str | None = None) -> pd.DataFrame:
     if _is_excel_response(response, url):
-        return _read_excel_response(response.content, preferred_sheet=preferred_sheet)
+        try:
+            return _read_excel_response(response.content, preferred_sheet=preferred_sheet)
+        except Exception:
+            text_start = response.content[:1000].decode("utf-8", errors="replace").lower()
+            if "<table" in text_start:
+                tables = pd.read_html(io.BytesIO(response.content), header=None)
+                if tables:
+                    return tables[0]
+            if "\x00" not in text_start and any(delimiter in text_start for delimiter in [",", "\t", ";"]):
+                return _read_delimited_response(response.content, required_column=required_column)
+            raise
     text_start = response.content[:500].decode("utf-8", errors="replace").lower()
     if "<html" in text_start or not response.content.strip():
         debug_path = _write_debug_response("unexpected_tabular_response", response)
         raise RuntimeError(f"empty/HTML response instead of table; {_format_fetch_debug(response)}; debug={debug_path.relative_to(ROOT_DIR)}")
     return _read_delimited_response(response.content, required_column=required_column)
+
+
+def _header_score(values: list[object], accepted_labels: set[str]) -> int:
+    normalized = {_normalize_header_text(value) for value in values if not pd.isna(value)}
+    return sum(1 for label in accepted_labels if label in normalized)
+
+
+def _promote_detected_header(df: pd.DataFrame, labels: set[str], label: str) -> tuple[pd.DataFrame, int, list[str], list[list[str]]]:
+    preview = df.head(20).fillna("").astype(str).values.tolist()
+    best_index: int | None = None
+    best_score = 0
+    for index, row in df.head(20).iterrows():
+        values = row.tolist()
+        score = _header_score(values, labels)
+        if score > best_score:
+            best_score = score
+            best_index = int(index)
+    if best_index is None or best_score == 0:
+        raise RuntimeError(f"{label} header row not found in first 20 rows; preview={preview}")
+    columns = [re.sub(r"\s+", " ", str(value)).strip() for value in df.iloc[best_index].tolist()]
+    promoted = df.iloc[best_index + 1 :].copy()
+    promoted.columns = columns
+    promoted = promoted.dropna(how="all")
+    return promoted, best_index, columns, preview
 
 def fetch_sox() -> UniverseResult:
     errors: list[str] = []
@@ -359,11 +452,20 @@ def fetch_sox() -> UniverseResult:
         try:
             response = _download_with_retries(url, timeout=120, attempts=2, label=f"SOX {trade_date_text}")
             resolved_url = response.final_url
-            df = _read_tabular_response(response, resolved_url, required_column="Ticker")
-            tickers = _dataframe_tickers(df)
+            raw_df = _read_tabular_response(response, resolved_url, required_column="Ticker")
+            df, header_index, columns, preview = _promote_detected_header(
+                raw_df,
+                {"ticker", "symbol", "security symbol", "index share", "name", "weight"},
+                "SOX",
+            )
+            tickers = _dataframe_tickers(df, preferred_columns=("ticker", "symbol", "security symbol"))
             if not tickers:
                 raise RuntimeError("no SOX tickers parsed")
-            return UniverseResult(tickers, resolved_url=resolved_url, notes=f"tradeDate={trade_date_text}")
+            return UniverseResult(
+                tickers,
+                resolved_url=resolved_url,
+                notes=f"tradeDate={trade_date_text}; header_row={header_index}; columns={columns}; preview_first_20={preview}",
+            )
         except Exception as exc:  # noqa: BLE001 - try recent prior trading dates.
             errors.append(f"{trade_date_text}: {exc}")
     raise RuntimeError("No valid SOX weighting export found in the last 8 calendar days; " + "; ".join(errors))
@@ -398,6 +500,11 @@ def _json_content_type(content_type: str) -> bool:
     return content_type == "application/json" or content_type.endswith("+json") or "json" in content_type
 
 
+def _is_json_like_response(response: FetchResponse) -> bool:
+    text = response.content[:200].decode("utf-8-sig", errors="replace").lstrip()
+    return _json_content_type(response.content_type) or text.startswith(("{", "["))
+
+
 def _load_json_response(response: FetchResponse, label: str) -> Any:
     text = response.content.decode("utf-8-sig", errors="replace")
     if not _json_content_type(response.content_type) and not text.lstrip().startswith(("{", "[")):
@@ -410,15 +517,20 @@ def _load_json_response(response: FetchResponse, label: str) -> Any:
         raise RuntimeError(f"JSON parse failed; {_format_fetch_debug(response, exc)}; debug={debug_path.relative_to(ROOT_DIR)}") from exc
 
 
-def _resolve_blackrock_holdings_url(api_url: str) -> str:
+def _resolve_blackrock_holdings(api_url: str) -> tuple[str, FetchResponse | None]:
     response = _download_with_retries(api_url, timeout=120, attempts=3, label="BlackRock document API")
+    if not _is_json_like_response(response):
+        if _is_excel_response(response, response.final_url) or response.content.lstrip().lower().startswith((b"ticker", b"security")):
+            return response.final_url, response
+        debug_path = _write_debug_response("blackrock_document_api_unexpected", response)
+        raise RuntimeError(f"BlackRock fund document API returned unsupported direct content; {_format_fetch_debug(response)}; debug={debug_path.relative_to(ROOT_DIR)}")
     payload = _load_json_response(response, "blackrock_document_api")
     urls = _extract_urls(payload)
     candidates = [url for url in urls if re.search(r"(holdings|fund|download|csv|xls|xlsx|fileType=)", url, flags=re.IGNORECASE)] or urls
     if not candidates:
         debug_path = _write_debug_response("blackrock_no_holdings_url", response)
         raise RuntimeError(f"BlackRock fund document API did not include a holdings download URL; debug={debug_path.relative_to(ROOT_DIR)}")
-    return candidates[0]
+    return candidates[0], None
 
 
 def _read_holdings_file(response: FetchResponse, url: str) -> pd.DataFrame:
@@ -443,14 +555,16 @@ def _find_csv_header_index(lines: list[str], required_column: str) -> int | None
 
 def _fetch_blackrock_holdings(universe_name: str) -> UniverseResult:
     api_url = str(SOURCE_METADATA[universe_name]["source_url"])
-    holdings_url = _resolve_blackrock_holdings_url(api_url)
-    response = _download_with_retries(holdings_url, timeout=180, attempts=3, label=f"{universe_name} holdings")
+    holdings_url, direct_response = _resolve_blackrock_holdings(api_url)
+    response = direct_response or _download_with_retries(holdings_url, timeout=180, attempts=3, label=f"{universe_name} holdings")
     resolved_url = response.final_url
-    df = _read_holdings_file(response, resolved_url)
+    raw_df = _read_holdings_file(response, resolved_url)
+    df, header_index, columns, _preview = _promote_detected_header(raw_df, {"ticker"}, f"{universe_name} BlackRock holdings")
     tickers = _dataframe_tickers(df, preferred_columns=("ticker",))
     if not tickers:
         raise RuntimeError(f"No equity tickers parsed for {universe_name}")
-    return UniverseResult(tickers, resolved_url=resolved_url, notes=f"holdings_url={holdings_url}")
+    mode = "direct_document_api_response" if direct_response else "resolved_holdings_url"
+    return UniverseResult(tickers, resolved_url=resolved_url, notes=f"{mode}; holdings_url={holdings_url}; header_row={header_index}; columns={columns}")
 
 
 def fetch_russell1000() -> UniverseResult:
