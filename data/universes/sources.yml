@@ -1,0 +1,47 @@
+SPX:
+  provider: Wikipedia
+  method: html_table
+  source_url: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+  expected_count: 500
+  fallback: none
+  audit_notes: "Public constituent table; non-official but reproducible and easy to audit."
+
+NDX:
+  provider: Nasdaq
+  method: public_constituents
+  source_url: "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+  expected_count: 100
+  fallback: none
+  audit_notes: "Public Nasdaq-100 constituent source."
+
+SOXX:
+  provider: BlackRock/iShares
+  method: holdings_csv
+  source_url: "https://www.ishares.com/us/products/239705/ishares-soxx-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
+  expected_count: 30
+  fallback: none
+  audit_notes: "ETF holdings proxy for SOXX universe."
+
+RUSSELL1000:
+  provider: BlackRock/iShares
+  method: holdings_csv
+  source_url: "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+  expected_count: 1000
+  fallback: none
+  audit_notes: "ETF holdings proxy using IWB for Russell 1000 universe."
+
+RUSSELL2000:
+  provider: BlackRock/iShares
+  method: holdings_csv
+  source_url: "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+  expected_count: 2000
+  fallback: none
+  audit_notes: "ETF holdings proxy using IWM for Russell 2000 universe."
+
+NASDAQ100_CSV:
+  provider: checked-in legacy source input
+  method: manual_csv
+  source_url: "data/universes/nasdaq100.csv"
+  expected_count: 100
+  fallback: none
+  audit_notes: "Legacy V0 input for --universe-csv examples; not used by Company Master V1."
