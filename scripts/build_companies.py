@@ -13,6 +13,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -28,6 +29,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "constellation.db"
 CSV_PATH = DATA_DIR / "companies.csv"
+UNIVERSE_DIR = DATA_DIR / "universes"
+SOXX_FALLBACK_PATH = UNIVERSE_DIR / "soxx.csv"
 
 EXPECTED_COLUMNS = [
     "ticker",
@@ -42,10 +45,25 @@ EXPECTED_COLUMNS = [
 USER_AGENT = "ConstellationCompanyMaster/1.0 (+https://github.com/)"
 
 
+class UniverseStatus(str, Enum):
+    FETCHED = "fetched"
+    LOCAL_FALLBACK = "local fallback"
+    SKIPPED = "skipped"
+
+
 @dataclass(frozen=True)
 class UniverseSource:
     name: str
     fetcher: Callable[[], set[str]]
+    fallback_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class UniverseFetchSummary:
+    name: str
+    count: int
+    status: UniverseStatus
+    detail: str | None = None
 
 
 def normalize_ticker(value: object) -> str:
@@ -89,6 +107,19 @@ def fetch_ndx() -> set[str]:
     )
 
 
+def _find_csv_header_index(lines: list[str], required_column: str) -> int | None:
+    """Find a CSV header even when a provider adds notes or reorders columns."""
+    for index, line in enumerate(lines):
+        try:
+            columns = next(csv.reader([line]))
+        except csv.Error:
+            continue
+        normalized_columns = {column.strip().lower() for column in columns}
+        if required_column.lower() in normalized_columns:
+            return index
+    return None
+
+
 def _fetch_ishares_holdings(etf_ticker: str) -> set[str]:
     url = f"https://www.ishares.com/us/products/{_ISHARES_PRODUCT_IDS[etf_ticker]}/ishares-{etf_ticker.lower()}-etf/1467271812596.ajax?fileType=csv&fileName={etf_ticker}_holdings&dataType=fund"
     request = Request(url, headers={"User-Agent": USER_AGENT})
@@ -96,9 +127,7 @@ def _fetch_ishares_holdings(etf_ticker: str) -> set[str]:
         text = response.read().decode("utf-8-sig", errors="replace")
 
     lines = text.splitlines()
-    header_idx = next(
-        (i for i, line in enumerate(lines) if line.startswith("Ticker,")), None
-    )
+    header_idx = _find_csv_header_index(lines, "Ticker")
     if header_idx is None:
         raise RuntimeError(f"Could not find holdings header for {etf_ticker}")
     reader = csv.DictReader(lines[header_idx:])
@@ -106,9 +135,33 @@ def _fetch_ishares_holdings(etf_ticker: str) -> set[str]:
     for row in reader:
         ticker = normalize_ticker(row.get("Ticker"))
         asset_class = (row.get("Asset Class") or "").strip().lower()
-        if ticker and ticker != "-" and asset_class in {"equity", "stock"}:
+        if ticker and ticker != "-" and (
+            not asset_class or asset_class in {"equity", "stock"}
+        ):
             tickers.add(ticker)
     return tickers
+
+
+def fetch_local_universe(path: Path) -> set[str]:
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise RuntimeError(f"Local universe file has no header: {path}")
+        ticker_column = next(
+            (
+                column
+                for column in reader.fieldnames
+                if column.strip().lower() in {"ticker", "symbol"}
+            ),
+            None,
+        )
+        if ticker_column is None:
+            raise RuntimeError(f"Local universe file must include ticker or symbol column: {path}")
+        return {
+            ticker
+            for ticker in (normalize_ticker(row.get(ticker_column)) for row in reader)
+            if ticker
+        }
 
 
 _ISHARES_PRODUCT_IDS = {
@@ -131,23 +184,48 @@ def fetch_russell2000() -> set[str]:
     return _fetch_ishares_holdings("IWM")
 
 
-def fetch_universe_membership() -> dict[str, set[str]]:
+def fetch_universe_membership() -> tuple[dict[str, set[str]], list[UniverseFetchSummary]]:
     sources = [
         UniverseSource("SPX", fetch_spx),
         UniverseSource("NDX", fetch_ndx),
-        UniverseSource("SOXX", fetch_soxx),
+        UniverseSource("SOXX", fetch_soxx, SOXX_FALLBACK_PATH),
         UniverseSource("RUSSELL1000", fetch_russell1000),
         UniverseSource("RUSSELL2000", fetch_russell2000),
     ]
     membership: dict[str, set[str]] = defaultdict(set)
+    summaries: list[UniverseFetchSummary] = []
     for source in sources:
-        tickers = source.fetcher()
-        if not tickers:
-            raise RuntimeError(f"No tickers fetched for {source.name}")
+        status = UniverseStatus.FETCHED
+        detail = None
+        try:
+            tickers = source.fetcher()
+            if not tickers:
+                raise RuntimeError(f"No tickers fetched for {source.name}")
+        except Exception as exc:  # noqa: BLE001 - universe providers can change format or block requests.
+            if source.fallback_path and source.fallback_path.exists():
+                tickers = fetch_local_universe(source.fallback_path)
+                if not tickers:
+                    tickers = set()
+                    status = UniverseStatus.SKIPPED
+                    detail = f"primary fetch failed ({exc}); local fallback was empty"
+                    print(f"Warning: skipped {source.name}: {detail}")
+                else:
+                    status = UniverseStatus.LOCAL_FALLBACK
+                    fallback_path = source.fallback_path.relative_to(ROOT_DIR)
+                    detail = f"primary fetch failed ({exc}); loaded {fallback_path}"
+                    print(f"Warning: {source.name} loaded from local fallback: {detail}")
+            else:
+                tickers = set()
+                status = UniverseStatus.SKIPPED
+                detail = str(exc)
+                print(f"Warning: skipped {source.name}: {detail}")
         for ticker in tickers:
             membership[ticker].add(source.name)
-        print(f"Fetched {len(tickers):,} {source.name} tickers")
-    return dict(membership)
+        summaries.append(UniverseFetchSummary(source.name, len(tickers), status, detail))
+        print(f"Fetched {len(tickers):,} {source.name} tickers ({status.value})")
+    if not membership:
+        raise RuntimeError("No universe membership could be fetched")
+    return dict(membership), summaries
 
 
 def fetch_metadata(tickers: list[str]) -> dict[str, dict[str, str | None]]:
@@ -278,7 +356,7 @@ def validate_outputs() -> None:
 
 def main() -> None:
     print("1. Fetch universe membership.")
-    membership = fetch_universe_membership()
+    membership, universe_summaries = fetch_universe_membership()
     tickers = sorted(membership)
 
     print("2. Fetch company metadata.")
@@ -295,18 +373,21 @@ def main() -> None:
     missing_metadata_count = sum(
         1
         for row in rows
-        if not row["company_name"] or not row["sector"] or not row["industry"] or not row["description"]
+        if (
+            not row["company_name"]
+            or not row["sector"]
+            or not row["industry"]
+            or not row["description"]
+        )
     )
-    universe_counts = {
-        universe: sum(1 for memberships in membership.values() if universe in memberships)
-        for universe in ["SPX", "NDX", "SOXX", "RUSSELL1000", "RUSSELL2000"]
-    }
-
     print("5. Summary")
     print(f"total company count: {len(rows):,}")
     print("universe counts:")
-    for universe, count in universe_counts.items():
-        print(f"  {universe}: {count:,}")
+    for summary in universe_summaries:
+        status_note = summary.status.value
+        if summary.detail:
+            status_note = f"{status_note}; {summary.detail}"
+        print(f"  {summary.name}: {summary.count:,} ({status_note})")
     print(f"missing metadata count: {missing_metadata_count:,}")
     print(f"SQLite path: {DB_PATH}")
     print(f"CSV path: {CSV_PATH}")
