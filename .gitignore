@@ -22,3 +22,4 @@ data/companies.csv
 data/exports/
 data/cache/
 data/universe_audit.json
+data/debug/
