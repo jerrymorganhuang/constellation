@@ -12,6 +12,7 @@ import io
 import json
 import re
 import sqlite3
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -49,7 +51,16 @@ EXPECTED_COLUMNS = [
 
 SUPPORTED_UNIVERSES = ["SPX", "NDX", "SOX", "RUSSELL1000", "RUSSELL2000"]
 
-USER_AGENT = "ConstellationCompanyMaster/1.0 (+https://github.com/)"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 ConstellationCompanyMaster/1.0"
+DEBUG_DIR = DATA_DIR / "debug"
+
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,application/json,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 NDX_URL = "https://www.nasdaq.com/solutions/global-indexes/nasdaq-100/companies"
 SOX_EXPORT_URL_TEMPLATE = "https://indexes.nasdaqomx.com/Index/ExportWeightings/SOX?tradeDate={trade_date}T00:00:00.000&timeOfDay=SOD"
@@ -93,6 +104,14 @@ SOURCE_METADATA = {
 class UniverseStatus(str, Enum):
     FETCHED = "fetched"
     SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class FetchResponse:
+    content: bytes
+    final_url: str
+    status_code: int | None
+    content_type: str
 
 
 @dataclass(frozen=True)
@@ -143,18 +162,95 @@ def normalize_ticker(value: object) -> str:
     return ticker
 
 
-def _request(url: str) -> Request:
-    return Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+def _request(url: str, headers: dict[str, str] | None = None) -> Request:
+    request_headers = dict(BROWSER_HEADERS)
+    if headers:
+        request_headers.update(headers)
+    return Request(url, headers=request_headers)
 
 
-def _download(url: str, timeout: int = 90) -> tuple[bytes, str]:
-    with urlopen(_request(url), timeout=timeout) as response:
-        return response.read(), response.geturl()
+def _response_content_type(headers: Any) -> str:
+    return str(headers.get("Content-Type") or headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+
+
+def _snippet(content: bytes, limit: int = 300) -> str:
+    return content[:limit].decode("utf-8", errors="replace").replace("\x00", "\\0")
+
+
+def _debug_slug(label: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_")[:120] or "response"
+
+
+def _write_debug_response(label: str, response: FetchResponse | None, error: Exception | None = None) -> Path:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = DEBUG_DIR / f"{timestamp}_{_debug_slug(label)}"
+    meta_path = base.with_suffix(".json")
+    raw_path = base.with_suffix(".bin")
+    if response is not None:
+        raw_path.write_bytes(response.content)
+    meta = {
+        "label": label,
+        "status_code": response.status_code if response else None,
+        "content_type": response.content_type if response else None,
+        "final_url": response.final_url if response else None,
+        "snippet": _snippet(response.content) if response else None,
+        "error": str(error) if error else None,
+        "raw_path": str(raw_path.relative_to(ROOT_DIR)) if response is not None else None,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return meta_path
+
+
+def _format_fetch_debug(response: FetchResponse | None, error: Exception | None = None) -> str:
+    parts = []
+    if response is not None:
+        parts.extend([
+            f"status_code={response.status_code}",
+            f"content_type={response.content_type or '<none>'}",
+            f"final_url={response.final_url}",
+            f"snippet={_snippet(response.content)!r}",
+        ])
+    if error is not None:
+        parts.append(f"error={error}")
+    return "; ".join(parts)
+
+
+def _download_response(url: str, timeout: int = 90, headers: dict[str, str] | None = None) -> FetchResponse:
+    try:
+        with urlopen(_request(url, headers), timeout=timeout) as response:
+            content = response.read()
+            return FetchResponse(content, response.geturl(), getattr(response, "status", None), _response_content_type(response.headers))
+    except HTTPError as exc:
+        content = exc.read()
+        response = FetchResponse(content, exc.geturl(), exc.code, _response_content_type(exc.headers))
+        _write_debug_response("http_error", response, exc)
+        raise RuntimeError(f"HTTP fetch failed for {url}: {_format_fetch_debug(response, exc)}") from exc
+    except URLError as exc:
+        _write_debug_response("url_error", None, exc)
+        raise RuntimeError(f"HTTP fetch failed for {url}: {_format_fetch_debug(None, exc)}") from exc
+
+
+def _download(url: str, timeout: int = 90, headers: dict[str, str] | None = None) -> tuple[bytes, str]:
+    response = _download_response(url, timeout=timeout, headers=headers)
+    return response.content, response.final_url
+
+
+def _download_with_retries(url: str, timeout: int = 120, attempts: int = 3, headers: dict[str, str] | None = None, label: str = "fetch") -> FetchResponse:
+    errors: list[str] = []
+    for attempt in range(1, attempts + 1):
+        try:
+            return _download_response(url, timeout=timeout, headers=headers)
+        except Exception as exc:  # noqa: BLE001 - retries are diagnostic/backoff only.
+            errors.append(f"attempt {attempt}: {exc}")
+            if attempt < attempts:
+                time.sleep(2 ** (attempt - 1))
+    raise RuntimeError(f"{label} failed after {attempts} attempts; " + " | ".join(errors))
 
 
 def _read_html_tables(url: str) -> tuple[list[pd.DataFrame], str]:
-    html, resolved_url = _download(url)
-    return pd.read_html(io.BytesIO(html)), resolved_url
+    response = _download_with_retries(url, timeout=120, attempts=3, label="html_table")
+    return pd.read_html(io.BytesIO(response.content)), response.final_url
 
 
 def _tickers_from_wikipedia_table(url: str, required_column: str) -> UniverseResult:
@@ -171,7 +267,9 @@ def fetch_spx() -> UniverseResult:
 
 
 def fetch_ndx() -> UniverseResult:
-    html, resolved_url = _download(NDX_URL)
+    response = _download_with_retries(NDX_URL, timeout=180, attempts=4, label="NDX")
+    html = response.content
+    resolved_url = response.final_url
     tables = pd.read_html(io.BytesIO(html))
     for table in tables:
         columns = {str(column).strip().lower(): column for column in table.columns}
@@ -204,6 +302,54 @@ def _dataframe_tickers(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("
     return tickers
 
 
+
+def _is_excel_response(response: FetchResponse, url: str) -> bool:
+    lower_url = url.lower()
+    content_type = response.content_type
+    return (
+        lower_url.endswith((".xls", ".xlsx"))
+        or response.content[:2] == b"PK"
+        or response.content[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        or "spreadsheet" in content_type
+        or "excel" in content_type
+        or content_type in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    )
+
+
+def _read_excel_response(content: bytes, preferred_sheet: str | None = None) -> pd.DataFrame:
+    if preferred_sheet:
+        try:
+            return pd.read_excel(io.BytesIO(content), sheet_name=preferred_sheet)
+        except ValueError:
+            pass
+    sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+    if not sheets:
+        raise RuntimeError("Excel workbook did not contain readable sheets")
+    if preferred_sheet and preferred_sheet.lower() in {name.lower(): name for name in sheets}:
+        names = {name.lower(): name for name in sheets}
+        return sheets[names[preferred_sheet.lower()]]
+    return next(iter(sheets.values()))
+
+
+def _read_delimited_response(content: bytes, required_column: str = "Ticker") -> pd.DataFrame:
+    text = content.decode("utf-8-sig", errors="replace")
+    if "\x00" in text[:1000]:
+        raise RuntimeError("text response contains NUL bytes; likely binary/encoded data")
+    lines = text.splitlines()
+    header_idx = _find_csv_header_index(lines, required_column)
+    csv_text = "\n".join(lines[header_idx:]) if header_idx is not None else text
+    return pd.read_csv(io.StringIO(csv_text), sep=None, engine="python")
+
+
+def _read_tabular_response(response: FetchResponse, url: str, required_column: str = "Ticker", preferred_sheet: str | None = None) -> pd.DataFrame:
+    if _is_excel_response(response, url):
+        return _read_excel_response(response.content, preferred_sheet=preferred_sheet)
+    text_start = response.content[:500].decode("utf-8", errors="replace").lower()
+    if "<html" in text_start or not response.content.strip():
+        debug_path = _write_debug_response("unexpected_tabular_response", response)
+        raise RuntimeError(f"empty/HTML response instead of table; {_format_fetch_debug(response)}; debug={debug_path.relative_to(ROOT_DIR)}")
+    return _read_delimited_response(response.content, required_column=required_column)
+
 def fetch_sox() -> UniverseResult:
     errors: list[str] = []
     for offset in range(8):
@@ -211,11 +357,9 @@ def fetch_sox() -> UniverseResult:
         trade_date_text = trade_date.isoformat()
         url = SOX_EXPORT_URL_TEMPLATE.format(trade_date=trade_date_text)
         try:
-            content, resolved_url = _download(url)
-            text = content.decode("utf-8-sig", errors="replace")
-            if "<html" in text[:500].lower() or not text.strip():
-                raise RuntimeError("empty or HTML response instead of export table")
-            df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+            response = _download_with_retries(url, timeout=120, attempts=2, label=f"SOX {trade_date_text}")
+            resolved_url = response.final_url
+            df = _read_tabular_response(response, resolved_url, required_column="Ticker")
             tickers = _dataframe_tickers(df)
             if not tickers:
                 raise RuntimeError("no SOX tickers parsed")
@@ -250,29 +394,39 @@ def _extract_urls(value: Any) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+def _json_content_type(content_type: str) -> bool:
+    return content_type == "application/json" or content_type.endswith("+json") or "json" in content_type
+
+
+def _load_json_response(response: FetchResponse, label: str) -> Any:
+    text = response.content.decode("utf-8-sig", errors="replace")
+    if not _json_content_type(response.content_type) and not text.lstrip().startswith(("{", "[")):
+        debug_path = _write_debug_response(label, response)
+        raise RuntimeError(f"non-JSON response; {_format_fetch_debug(response)}; debug={debug_path.relative_to(ROOT_DIR)}")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        debug_path = _write_debug_response(label, response, exc)
+        raise RuntimeError(f"JSON parse failed; {_format_fetch_debug(response, exc)}; debug={debug_path.relative_to(ROOT_DIR)}") from exc
+
+
 def _resolve_blackrock_holdings_url(api_url: str) -> str:
-    content, _ = _download(api_url)
-    payload = json.loads(content.decode("utf-8", errors="replace"))
+    response = _download_with_retries(api_url, timeout=120, attempts=3, label="BlackRock document API")
+    payload = _load_json_response(response, "blackrock_document_api")
     urls = _extract_urls(payload)
-    candidates = [url for url in urls if re.search(r"(holdings|fund|download|csv|xls|xlsx)", url, flags=re.IGNORECASE)] or urls
+    candidates = [url for url in urls if re.search(r"(holdings|fund|download|csv|xls|xlsx|fileType=)", url, flags=re.IGNORECASE)] or urls
     if not candidates:
-        raise RuntimeError("BlackRock fund document API did not include a holdings download URL")
+        debug_path = _write_debug_response("blackrock_no_holdings_url", response)
+        raise RuntimeError(f"BlackRock fund document API did not include a holdings download URL; debug={debug_path.relative_to(ROOT_DIR)}")
     return candidates[0]
 
 
-def _read_holdings_file(content: bytes, url: str) -> pd.DataFrame:
-    lower_url = url.lower()
-    if lower_url.endswith((".xls", ".xlsx")) or content[:2] == b"PK" or content[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        try:
-            return pd.read_excel(io.BytesIO(content), sheet_name="Holdings")
-        except ValueError:
-            return pd.read_excel(io.BytesIO(content))
-    text = content.decode("utf-8-sig", errors="replace")
-    lines = text.splitlines()
-    header_idx = _find_csv_header_index(lines, "Ticker")
-    if header_idx is None:
-        raise RuntimeError("Could not find holdings CSV header")
-    return pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+def _read_holdings_file(response: FetchResponse, url: str) -> pd.DataFrame:
+    try:
+        return _read_tabular_response(response, url, required_column="Ticker", preferred_sheet="Holdings")
+    except Exception as exc:  # noqa: BLE001 - include raw response diagnostics.
+        debug_path = _write_debug_response("blackrock_holdings_parse_failed", response, exc)
+        raise RuntimeError(f"Could not parse BlackRock holdings file; {_format_fetch_debug(response, exc)}; debug={debug_path.relative_to(ROOT_DIR)}") from exc
 
 
 def _find_csv_header_index(lines: list[str], required_column: str) -> int | None:
@@ -290,8 +444,9 @@ def _find_csv_header_index(lines: list[str], required_column: str) -> int | None
 def _fetch_blackrock_holdings(universe_name: str) -> UniverseResult:
     api_url = str(SOURCE_METADATA[universe_name]["source_url"])
     holdings_url = _resolve_blackrock_holdings_url(api_url)
-    content, resolved_url = _download(holdings_url)
-    df = _read_holdings_file(content, resolved_url)
+    response = _download_with_retries(holdings_url, timeout=180, attempts=3, label=f"{universe_name} holdings")
+    resolved_url = response.final_url
+    df = _read_holdings_file(response, resolved_url)
     tickers = _dataframe_tickers(df, preferred_columns=("ticker",))
     if not tickers:
         raise RuntimeError(f"No equity tickers parsed for {universe_name}")
