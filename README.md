@@ -4,6 +4,46 @@ Constellation is a graph-based relationship explorer for U.S. public companies, 
 
 The goal is to build a lightweight investor research tool that allows users to search a company or person and visualize relationships such as CEO, CFO, executive-officer, and board membership.
 
+
+## Company Master V1
+
+The Company Master module builds the primary company reference store at `data/constellation.db` and exports a review CSV at `data/companies.csv`. SQLite is the primary data store for Constellation V1; CSV files are review/export artifacts generated from the builder output. Both generated files are intentionally ignored by git so the repository stays lightweight and reviewable. It supports the `SPX`, `NDX`, `SOXX`, `RUSSELL1000`, and `RUSSELL2000` universes. Universe membership is stored directly on each company as a semicolon-separated string, such as `SPX;NDX;SOXX`; no separate membership table is created.
+
+
+Repository policy for generated files:
+
+- Commit source code, documentation, dependency manifests, and stable source inputs such as `data/universes/*.csv`.
+- Do not commit generated SQLite databases, CSV exports, caches, or local virtual environments.
+- Regenerate `data/constellation.db` and `data/companies.csv` locally with `python scripts/build_companies.py` when needed.
+
+Run the builder from the repository root:
+
+```bash
+python scripts/build_companies.py
+```
+
+The script fetches universe membership from rule-based public sources, enriches company name, sector, industry, and description with `yfinance`, rebuilds the `companies` table in SQLite, exports `data/companies.csv`, and validates the generated outputs. Missing yfinance metadata is left blank/null.
+
+SQLite schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS companies (
+    ticker TEXT PRIMARY KEY,
+    company_name TEXT,
+    universe TEXT NOT NULL,
+    sector TEXT,
+    industry TEXT,
+    description TEXT,
+    updated_at TEXT NOT NULL
+);
+```
+
+CSV schema:
+
+```csv
+ticker,company_name,universe,sector,industry,description,updated_at
+```
+
 ## V0 Scope
 
 The first validation scope was SOXX constituents. The same signature-page extraction path can now also run against an explicit universe CSV, including the checked-in Nasdaq 100 universe at `data/universes/nasdaq100.csv`.

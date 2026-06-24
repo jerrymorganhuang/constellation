@@ -3,3 +3,4 @@ lxml>=5.0
 pandas>=2.0
 requests>=2.31
 neo4j>=5.0
+yfinance>=0.2.40

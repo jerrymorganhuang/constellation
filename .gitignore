@@ -1,6 +1,23 @@
+# Python bytecode/cache artifacts
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments
 .env
 .venv/
 venv/
+env/
+
+# Legacy/generated Constellation outputs
 data/constellation_v0/
+
+# Constellation V1 generated data artifacts
+# Keep checked-in source inputs under data/universes/, but regenerate these locally.
+data/constellation.db
+data/constellation.db-*
+data/companies.csv
+data/exports/
+data/cache/
