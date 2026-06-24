@@ -4,44 +4,36 @@ SPX:
   source_url: "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
   expected_count: 500
   fallback: none
-  audit_notes: "Public constituent table; non-official but reproducible and easy to audit."
+  audit_notes: "Public S&P 500 constituent table; non-official but reproducible and easy to audit."
 
 NDX:
   provider: Nasdaq
-  method: public_constituents
-  source_url: "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+  method: static_html_table
+  source_url: "https://www.nasdaq.com/solutions/global-indexes/nasdaq-100/companies"
   expected_count: 100
   fallback: none
-  audit_notes: "Public Nasdaq-100 constituent source."
+  audit_notes: "Official Nasdaq static Nasdaq-100 companies page; parse Symbol and Company Name table columns and record Last updated text when present."
 
-SOXX:
-  provider: BlackRock/iShares
-  method: holdings_csv
-  source_url: "https://www.ishares.com/us/products/239705/ishares-soxx-etf/1467271812596.ajax?fileType=csv&fileName=SOXX_holdings&dataType=fund"
+SOX:
+  provider: Nasdaq OMX
+  method: export_weightings
+  source_url: "https://indexes.nasdaqomx.com/Index/ExportWeightings/SOX?tradeDate={YYYY-MM-DD}T00:00:00.000&timeOfDay=SOD"
   expected_count: 30
   fallback: none
-  audit_notes: "ETF holdings proxy for SOXX universe."
+  audit_notes: "Official Nasdaq OMX SOX weighting export; try today then walk back up to 7 calendar days and record resolved URL and tradeDate."
 
 RUSSELL1000:
   provider: BlackRock/iShares
-  method: holdings_csv
-  source_url: "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+  method: fund_document_api_holdings
+  source_url: "https://www.blackrock.com/varnish-api/blk-one01-product-data/product-data/api/v1/get-fund-document?appType=PRODUCT_PAGE&appSubType=ISHARES&targetSite=us-ishares&locale=en_US&portfolioId=239707&component=fundDownload&userType=individual"
   expected_count: 1000
   fallback: none
-  audit_notes: "ETF holdings proxy using IWB for Russell 1000 universe."
+  audit_notes: "Official BlackRock fund document API resolves the IWB holdings download; supports CSV, XLS, and XLSX holdings files."
 
 RUSSELL2000:
   provider: BlackRock/iShares
-  method: holdings_csv
-  source_url: "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+  method: fund_document_api_holdings
+  source_url: "https://www.blackrock.com/varnish-api/blk-one01-product-data/product-data/api/v1/get-fund-document?appType=PRODUCT_PAGE&appSubType=ISHARES&targetSite=us-ishares&locale=en_US&portfolioId=239710&component=fundDownload&userType=individual"
   expected_count: 2000
   fallback: none
-  audit_notes: "ETF holdings proxy using IWM for Russell 2000 universe."
-
-NASDAQ100_CSV:
-  provider: checked-in legacy source input
-  method: manual_csv
-  source_url: "data/universes/nasdaq100.csv"
-  expected_count: 100
-  fallback: none
-  audit_notes: "Legacy V0 input for --universe-csv examples; not used by Company Master V1."
+  audit_notes: "Official BlackRock fund document API resolves the IWM holdings download; supports CSV, XLS, and XLSX holdings files."
