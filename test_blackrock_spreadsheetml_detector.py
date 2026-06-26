@@ -45,5 +45,34 @@ class BlackRockSpreadsheetMLDetectorTest(unittest.TestCase):
         self.assert_detects_spreadsheetml(f'<!-- BlackRock holdings --><Workbook {SPREADSHEET_NAMESPACE}></Workbook>')
 
 
+class BlackRockSpreadsheetMLParsingTest(unittest.TestCase):
+    def test_sanitizes_malformed_spreadsheetml_and_extracts_tickers(self):
+        xml = '''<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+  <Worksheet ss:Name="Holdings">
+    <Table>
+      <Row>
+        <Cell><Data ss:Type="String">Ticker</Data></Cell>
+        <Cell><Data ss:Type="String">Name</Data></Cell>
+        <Cell><Data ss:Type="String">Asset Class</Data></Cell>
+      </Row>
+      <Row>
+        <Cell><Data ss:Type="String">BRK.B</Data></Cell>
+        <Cell><Data ss:Type="String">Berkshire & Hathaway\x08 Inc</Data></Cell>
+        <Cell><Data ss:Type="String">Equity</Data></Cell>
+      </Row>
+    </Table>
+  </Worksheet>
+</Workbook>'''
+        raw_df, notes = build_companies._read_spreadsheetml_holdings(xml.encode("utf-8"), "BlackRock holdings")
+        df, _, _, _ = build_companies._promote_detected_header(raw_df, {"ticker"}, "BlackRock holdings")
+
+        self.assertEqual(build_companies._dataframe_tickers(df), {"BRK-B"})
+        self.assertIn("raw XML parse failed", notes)
+        self.assertIn("sanitized XML parse attempted", notes)
+        self.assertIn("parser_used=ElementTree sanitized", notes)
+        self.assertIn("original_parse_error=", notes)
+
+
 if __name__ == "__main__":
     unittest.main()
