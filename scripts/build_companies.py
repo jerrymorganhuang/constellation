@@ -14,6 +14,7 @@ import re
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import ParseError
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -26,6 +27,11 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 from bs4 import BeautifulSoup
+
+try:
+    from lxml import etree as LET
+except ImportError:  # pragma: no cover - lxml is an optional recovery parser.
+    LET = None
 
 try:
     import yfinance as yf
@@ -391,8 +397,59 @@ def _spreadsheetml_cell_text(cell: ET.Element) -> str:
     return "".join(cell.itertext()).strip()
 
 
-def _read_spreadsheetml_workbook(content: bytes) -> tuple[dict[str, pd.DataFrame], list[str]]:
-    root = ET.fromstring(content.decode("utf-8-sig", errors="replace"))
+def _decode_spreadsheetml_content(content: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8-sig", errors="replace")
+
+
+def _remove_invalid_xml_control_chars(text: str) -> str:
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+
+
+def _escape_bare_xml_ampersands(text: str) -> str:
+    return re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)", "&amp;", text)
+
+
+def _sanitize_spreadsheetml_xml(text: str) -> str:
+    return _escape_bare_xml_ampersands(_remove_invalid_xml_control_chars(text))
+
+
+def _parse_spreadsheetml_root(content: bytes) -> tuple[ET.Element, list[str]]:
+    notes: list[str] = []
+    text = _decode_spreadsheetml_content(content)
+    try:
+        return ET.fromstring(text), ["parser_used=ElementTree raw"]
+    except ParseError as exc:
+        original_error = str(exc)
+        notes.append("raw XML parse failed")
+        notes.append("sanitized XML parse attempted")
+        notes.append(f"original_parse_error={original_error}")
+
+    sanitized_text = _sanitize_spreadsheetml_xml(text)
+    try:
+        root = ET.fromstring(sanitized_text)
+        notes.append("parser_used=ElementTree sanitized")
+        return root, notes
+    except ParseError as sanitized_exc:
+        if LET is None:
+            raise RuntimeError(
+                f"SpreadsheetML XML parse failed after sanitization; original_parse_error={original_error}; "
+                f"sanitized_parse_error={sanitized_exc}"
+            ) from sanitized_exc
+        parser = LET.XMLParser(recover=True, resolve_entities=False)
+        lxml_root = LET.fromstring(sanitized_text.encode("utf-8"), parser=parser)
+        recovered_text = LET.tostring(lxml_root, encoding="unicode")
+        notes.append("parser_used=lxml recover")
+        root = ET.fromstring(recovered_text)
+        return root, notes
+
+
+def _read_spreadsheetml_workbook(content: bytes) -> tuple[dict[str, pd.DataFrame], list[str], list[str]]:
+    root, parse_notes = _parse_spreadsheetml_root(content)
     spreadsheet_ns = "urn:schemas-microsoft-com:office:spreadsheet"
     office_ns = "urn:schemas-microsoft-com:office:office"
     worksheets: dict[str, pd.DataFrame] = {}
@@ -417,7 +474,7 @@ def _read_spreadsheetml_workbook(content: bytes) -> tuple[dict[str, pd.DataFrame
         worksheets[name] = pd.DataFrame(padded_rows)
     if not worksheets:
         raise RuntimeError("SpreadsheetML workbook did not contain readable worksheets")
-    return worksheets, worksheet_names
+    return worksheets, worksheet_names, parse_notes
 
 
 def _detect_ticker_column_name(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("ticker", "symbol")) -> str:
@@ -429,7 +486,7 @@ def _detect_ticker_column_name(df: pd.DataFrame, preferred_columns: tuple[str, .
 
 
 def _read_spreadsheetml_holdings(content: bytes, label: str) -> tuple[pd.DataFrame, str]:
-    worksheets, worksheet_names = _read_spreadsheetml_workbook(content)
+    worksheets, worksheet_names, parse_notes = _read_spreadsheetml_workbook(content)
     selected_name: str | None = None
     selected_df: pd.DataFrame | None = None
     if "holdings" in {name.lower() for name in worksheet_names}:
@@ -449,7 +506,8 @@ def _read_spreadsheetml_holdings(content: bytes, label: str) -> tuple[pd.DataFra
             break
         if selected_df is None:
             raise RuntimeError(f"SpreadsheetML workbook has no worksheet containing a Ticker-like column; worksheets={worksheet_names}; scan_errors={scan_errors}")
-    return selected_df, f"workbook_type=spreadsheetml_xml; worksheet_names={worksheet_names}; selected_worksheet={selected_name}"
+    note_parts = ["workbook_type=spreadsheetml_xml", *parse_notes, f"worksheet_names={worksheet_names}", f"selected_worksheet={selected_name}"]
+    return selected_df, "; ".join(note_parts)
 
 def _read_excel_response(content: bytes, preferred_sheet: str | None = None) -> pd.DataFrame:
     read_kwargs: dict[str, Any] = {"header": None}
