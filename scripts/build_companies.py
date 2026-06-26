@@ -361,8 +361,11 @@ def _dataframe_tickers(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("
 
 
 def _is_spreadsheetml_response(content: bytes) -> bool:
-    text_start = content[:1000].decode("utf-8-sig", errors="replace").lstrip().lower()
-    return text_start.startswith("<?xml") and "<workbook" in text_start and "urn:schemas-microsoft-com:office:spreadsheet" in text_start
+    text_start = content[:8192].decode("utf-8-sig", errors="replace")
+    return (
+        "urn:schemas-microsoft-com:office:spreadsheet" in text_start
+        and re.search(r"<(?:[A-Za-z0-9_.-]+:)?Workbook\b", text_start) is not None
+    )
 
 
 def _is_excel_response(response: FetchResponse, url: str) -> bool:
