@@ -43,6 +43,7 @@ DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "constellation.db"
 CSV_PATH = DATA_DIR / "companies.csv"
 AUDIT_PATH = DATA_DIR / "universe_audit.json"
+EXCLUDED_COMPANIES_PATH = DATA_DIR / "excluded_companies.csv"
 UNIVERSE_DIR = DATA_DIR / "universes"
 SOURCES_PATH = UNIVERSE_DIR / "sources.yml"
 
@@ -58,6 +59,7 @@ EXPECTED_COLUMNS = [
 ]
 
 SUPPORTED_UNIVERSES = ["SPX", "NDX", "SOX", "RUSSELL1000", "RUSSELL2000"]
+INVALID_PLACEHOLDER_TICKERS = {"", "-", "--", "------------", "*", "—", "N/A", "NA", "NAN", "NONE", "NULL"}
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 ConstellationCompanyMaster/1.0"
 DEBUG_DIR = DATA_DIR / "debug"
@@ -130,6 +132,14 @@ class UniverseResult:
 
 
 @dataclass(frozen=True)
+class ExcludedCompany:
+    ticker: str
+    universe: str
+    reason: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class UniverseSource:
     name: str
     fetcher: Callable[[], UniverseResult]
@@ -165,7 +175,7 @@ def normalize_ticker(value: object) -> str:
     ticker = str(value).strip().upper()
     ticker = re.sub(r"\s+", "", ticker)
     ticker = ticker.replace(".", "-")
-    if ticker in {"-", "—", "N/A", "NA", "NAN", "NONE", "CASH", "USD", "US DOLLAR"}:
+    if ticker in INVALID_PLACEHOLDER_TICKERS | {"CASH", "USD", "US DOLLAR"}:
         return ""
     return ticker
 
@@ -752,18 +762,40 @@ def fetch_universe_membership() -> tuple[dict[str, set[str]], list[UniverseFetch
     return dict(membership), summaries
 
 
+def _is_invalid_placeholder_ticker(ticker: str) -> bool:
+    return ticker.strip().upper() in INVALID_PLACEHOLDER_TICKERS
+
+
+def filter_invalid_tickers(membership: dict[str, set[str]]) -> tuple[dict[str, set[str]], list[ExcludedCompany]]:
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    clean_membership: dict[str, set[str]] = {}
+    excluded: list[ExcludedCompany] = []
+    for ticker, universes in membership.items():
+        if _is_invalid_placeholder_ticker(ticker):
+            excluded.append(ExcludedCompany(ticker, ";".join(sorted(universes)), "invalid_placeholder_ticker", updated_at))
+            continue
+        clean_membership[ticker] = universes
+    return clean_membership, excluded
+
+
 def fetch_metadata(tickers: list[str]) -> dict[str, dict[str, str | None]]:
     metadata: dict[str, dict[str, str | None]] = {}
     if yf is None:
         print("Warning: yfinance is not installed; metadata fields will be blank")
         return {ticker: {"company_name": None, "sector": None, "industry": None, "description": None} for ticker in tickers}
     for index, ticker in enumerate(tickers, start=1):
+        if _is_invalid_placeholder_ticker(ticker):
+            raise RuntimeError(f"Invalid placeholder ticker reached metadata fetch: {ticker!r}")
         if index == 1 or index % 100 == 0 or index == len(tickers):
             print(f"Fetching company metadata {index:,}/{len(tickers):,}")
         try:
-            info = yf.Ticker(ticker).get_info()
+            info = yf.Ticker(ticker).get_info() or {}
         except Exception as exc:  # noqa: BLE001 - keep rerunnable even when one symbol fails.
-            print(f"Warning: yfinance metadata failed for {ticker}: {exc}")
+            message = str(exc)
+            if "404" in message or "Quote not found" in message:
+                print(f"Warning: yfinance metadata not found for {ticker}")
+            else:
+                print(f"Warning: yfinance metadata failed for {ticker}: {message.splitlines()[0][:160]}")
             info = {}
         metadata[ticker] = {
             "company_name": info.get("longName") or info.get("shortName") or None,
@@ -795,14 +827,22 @@ def derive_description_short(description: str | None) -> str | None:
     return f"{truncated.rstrip('.,;:')}..."
 
 
-def build_rows(membership: dict[str, set[str]], metadata: dict[str, dict[str, str | None]]) -> list[dict[str, str | None]]:
+def _has_company_identity(meta: dict[str, str | None]) -> bool:
+    return any(meta.get(field) for field in ("company_name", "sector", "industry", "description"))
+
+
+def build_rows(membership: dict[str, set[str]], metadata: dict[str, dict[str, str | None]]) -> tuple[list[dict[str, str | None]], list[ExcludedCompany]]:
     updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows: list[dict[str, str | None]] = []
+    excluded: list[ExcludedCompany] = []
     for ticker in sorted(membership):
         meta = metadata.get(ticker, {})
+        if not _has_company_identity(meta):
+            excluded.append(ExcludedCompany(ticker, ";".join(sorted(membership[ticker])), "metadata_not_found_empty_company", updated_at))
+            continue
         description = meta.get("description")
         rows.append({"ticker": ticker, "company_name": meta.get("company_name"), "universe": ";".join(sorted(membership[ticker])), "sector": meta.get("sector"), "industry": meta.get("industry"), "description": description, "description_short": derive_description_short(description), "updated_at": updated_at})
-    return rows
+    return rows, excluded
 
 
 def write_sqlite(rows: list[dict[str, str | None]]) -> None:
@@ -837,10 +877,33 @@ def write_csv(rows: list[dict[str, str | None]]) -> None:
         writer.writerows(rows)
 
 
-def write_universe_audit(summaries: list[UniverseFetchSummary]) -> None:
+
+def write_excluded_companies(excluded: list[ExcludedCompany]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with EXCLUDED_COMPANIES_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["ticker", "universe", "reason", "updated_at"])
+        writer.writeheader()
+        writer.writerows([excluded_company.__dict__ for excluded_company in excluded])
+
+
+def _exclusion_reason_counts(excluded: list[ExcludedCompany]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for excluded_company in excluded:
+        counts[excluded_company.reason] += 1
+    return dict(sorted(counts.items()))
+
+
+def write_universe_audit(summaries: list[UniverseFetchSummary], excluded: list[ExcludedCompany] | None = None) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    excluded = excluded or []
     audit_rows = [{"universe": summary.name, "provider": summary.provider, "method": summary.method, "source_url": summary.source_url, "resolved_url": summary.resolved_url, "status": summary.status.value, "count": summary.count, "fetched_at": summary.fetched_at, "error": summary.error, "notes": summary.notes} for summary in summaries]
-    AUDIT_PATH.write_text(json.dumps(audit_rows, indent=2) + "\n", encoding="utf-8")
+    audit = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "excluded_company_count": len(excluded),
+        "exclusion_reason_counts": _exclusion_reason_counts(excluded),
+        "universes": audit_rows,
+    }
+    AUDIT_PATH.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
 
 
 def validate_sources_file() -> None:
@@ -895,12 +958,15 @@ def validate_outputs() -> None:
 def main() -> None:
     print("1. Fetch universe membership.")
     membership, universe_summaries = fetch_universe_membership()
-    write_universe_audit(universe_summaries)
+    membership, invalid_exclusions = filter_invalid_tickers(membership)
     tickers = sorted(membership)
 
     print("2. Fetch company metadata.")
     metadata = fetch_metadata(tickers)
-    rows = build_rows(membership, metadata)
+    rows, metadata_exclusions = build_rows(membership, metadata)
+    excluded_companies = invalid_exclusions + metadata_exclusions
+    write_excluded_companies(excluded_companies)
+    write_universe_audit(universe_summaries, excluded_companies)
 
     print("3. Build/update data/constellation.db.")
     write_sqlite(rows)
@@ -919,8 +985,10 @@ def main() -> None:
             status_note = f"{status_note}; {summary.error}"
         print(f"  {summary.name}: {summary.count:,} ({summary.provider} / {summary.method}; {status_note})")
     print(f"missing metadata count: {missing_metadata_count:,}")
+    print(f"excluded company count: {len(excluded_companies):,}")
     print(f"SQLite path: {DB_PATH}")
     print(f"CSV path: {CSV_PATH}")
+    print(f"Excluded companies path: {EXCLUDED_COMPANIES_PATH}")
     print(f"Audit path: {AUDIT_PATH}")
 
 
