@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import time
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -359,6 +360,11 @@ def _dataframe_tickers(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("
 
 
 
+def _is_spreadsheetml_response(content: bytes) -> bool:
+    text_start = content[:1000].decode("utf-8-sig", errors="replace").lstrip().lower()
+    return text_start.startswith("<?xml") and "<workbook" in text_start and "urn:schemas-microsoft-com:office:spreadsheet" in text_start
+
+
 def _is_excel_response(response: FetchResponse, url: str) -> bool:
     lower_url = url.lower()
     content_type = response.content_type
@@ -367,12 +373,80 @@ def _is_excel_response(response: FetchResponse, url: str) -> bool:
         lower_url.endswith((".xls", ".xlsx"))
         or response.content[:2] == b"PK"
         or response.content[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
-        or ("<workbook" in text_start and "spreadsheet" in text_start)
+        or _is_spreadsheetml_response(response.content)
         or "spreadsheet" in content_type
         or "excel" in content_type
         or content_type in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
     )
 
+
+
+def _spreadsheetml_cell_text(cell: ET.Element) -> str:
+    data = cell.find("{urn:schemas-microsoft-com:office:spreadsheet}Data")
+    if data is not None:
+        return "" if data.text is None else str(data.text)
+    return "".join(cell.itertext()).strip()
+
+
+def _read_spreadsheetml_workbook(content: bytes) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    root = ET.fromstring(content.decode("utf-8-sig", errors="replace"))
+    spreadsheet_ns = "urn:schemas-microsoft-com:office:spreadsheet"
+    office_ns = "urn:schemas-microsoft-com:office:office"
+    worksheets: dict[str, pd.DataFrame] = {}
+    worksheet_names: list[str] = []
+    for index, worksheet in enumerate(root.findall(f"{{{spreadsheet_ns}}}Worksheet"), start=1):
+        name = worksheet.get(f"{{{spreadsheet_ns}}}Name") or worksheet.get(f"{{{office_ns}}}Name") or f"Sheet{index}"
+        worksheet_names.append(name)
+        table = worksheet.find(f"{{{spreadsheet_ns}}}Table")
+        rows: list[list[str]] = []
+        if table is not None:
+            for row in table.findall(f"{{{spreadsheet_ns}}}Row"):
+                values: list[str] = []
+                for cell in row.findall(f"{{{spreadsheet_ns}}}Cell"):
+                    cell_index = cell.get(f"{{{spreadsheet_ns}}}Index")
+                    if cell_index and cell_index.isdigit():
+                        while len(values) < int(cell_index) - 1:
+                            values.append("")
+                    values.append(_spreadsheetml_cell_text(cell))
+                rows.append(values)
+        width = max((len(row) for row in rows), default=0)
+        padded_rows = [row + [""] * (width - len(row)) for row in rows]
+        worksheets[name] = pd.DataFrame(padded_rows)
+    if not worksheets:
+        raise RuntimeError("SpreadsheetML workbook did not contain readable worksheets")
+    return worksheets, worksheet_names
+
+
+def _detect_ticker_column_name(df: pd.DataFrame, preferred_columns: tuple[str, ...] = ("ticker", "symbol")) -> str:
+    columns = {_normalize_header_text(column): column for column in df.columns}
+    column = next((columns[_normalize_header_text(name)] for name in preferred_columns if _normalize_header_text(name) in columns), None)
+    if column is None:
+        raise RuntimeError(f"No ticker column found in columns: {list(df.columns)}")
+    return str(column)
+
+
+def _read_spreadsheetml_holdings(content: bytes, label: str) -> tuple[pd.DataFrame, str]:
+    worksheets, worksheet_names = _read_spreadsheetml_workbook(content)
+    selected_name: str | None = None
+    selected_df: pd.DataFrame | None = None
+    if "holdings" in {name.lower() for name in worksheet_names}:
+        names = {name.lower(): name for name in worksheet_names}
+        selected_name = names["holdings"]
+        selected_df = worksheets[selected_name]
+    else:
+        scan_errors: list[str] = []
+        for name, sheet_df in worksheets.items():
+            try:
+                _promote_detected_header(sheet_df, {"ticker"}, f"{label} {name}")
+            except Exception as exc:  # noqa: BLE001 - continue scanning workbook sheets.
+                scan_errors.append(f"{name}: {exc}")
+                continue
+            selected_name = name
+            selected_df = sheet_df
+            break
+        if selected_df is None:
+            raise RuntimeError(f"SpreadsheetML workbook has no worksheet containing a Ticker-like column; worksheets={worksheet_names}; scan_errors={scan_errors}")
+    return selected_df, f"workbook_type=spreadsheetml_xml; worksheet_names={worksheet_names}; selected_worksheet={selected_name}"
 
 def _read_excel_response(content: bytes, preferred_sheet: str | None = None) -> pd.DataFrame:
     read_kwargs: dict[str, Any] = {"header": None}
@@ -533,9 +607,11 @@ def _resolve_blackrock_holdings(api_url: str) -> tuple[str, FetchResponse | None
     return candidates[0], None
 
 
-def _read_holdings_file(response: FetchResponse, url: str) -> pd.DataFrame:
+def _read_holdings_file(response: FetchResponse, url: str) -> tuple[pd.DataFrame, str]:
     try:
-        return _read_tabular_response(response, url, required_column="Ticker", preferred_sheet="Holdings")
+        if _is_spreadsheetml_response(response.content):
+            return _read_spreadsheetml_holdings(response.content, "BlackRock holdings")
+        return _read_tabular_response(response, url, required_column="Ticker", preferred_sheet="Holdings"), "workbook_type=standard_tabular"
     except Exception as exc:  # noqa: BLE001 - include raw response diagnostics.
         debug_path = _write_debug_response("blackrock_holdings_parse_failed", response, exc)
         raise RuntimeError(f"Could not parse BlackRock holdings file; {_format_fetch_debug(response, exc)}; debug={debug_path.relative_to(ROOT_DIR)}") from exc
@@ -558,13 +634,14 @@ def _fetch_blackrock_holdings(universe_name: str) -> UniverseResult:
     holdings_url, direct_response = _resolve_blackrock_holdings(api_url)
     response = direct_response or _download_with_retries(holdings_url, timeout=180, attempts=3, label=f"{universe_name} holdings")
     resolved_url = response.final_url
-    raw_df = _read_holdings_file(response, resolved_url)
+    raw_df, parse_notes = _read_holdings_file(response, resolved_url)
     df, header_index, columns, _preview = _promote_detected_header(raw_df, {"ticker"}, f"{universe_name} BlackRock holdings")
+    ticker_column = _detect_ticker_column_name(df, preferred_columns=("ticker",))
     tickers = _dataframe_tickers(df, preferred_columns=("ticker",))
     if not tickers:
         raise RuntimeError(f"No equity tickers parsed for {universe_name}")
     mode = "direct_document_api_response" if direct_response else "resolved_holdings_url"
-    return UniverseResult(tickers, resolved_url=resolved_url, notes=f"{mode}; holdings_url={holdings_url}; header_row={header_index}; columns={columns}")
+    return UniverseResult(tickers, resolved_url=resolved_url, notes=f"{mode}; holdings_url={holdings_url}; {parse_notes}; header_row={header_index}; ticker_column={ticker_column}; columns={columns}")
 
 
 def fetch_russell1000() -> UniverseResult:
