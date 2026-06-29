@@ -19,7 +19,7 @@ MAX_TOKENS = 8000
 
 SYSTEM_PROMPT = """You are building a company relationship dataset.
 
-For each company below, identify all current members of the company’s official Executive Team / Management Team / Leadership Team / Senior Leadership, and all current members of the Board of Directors.
+For each company below, identify all current members of the company's official Executive Team / Management Team / Leadership Team / Senior Leadership, and all current members of the Board of Directors.
 
 Output strict JSON only.
 
@@ -50,7 +50,7 @@ Rules:
 2. For executives:
    - CEO / Chief Executive Officer / President and CEO should be standardized as CEO.
    - CFO / Chief Financial Officer should be standardized as CFO.
-   - All other executive roles should keep the company’s official title as closely as possible.
+   - All other executive roles should keep the company's official title as closely as possible.
 
 3. For board members:
    - Chairman / Chair of the Board / Executive Chairman / Independent Chairman should be standardized as Chairman.

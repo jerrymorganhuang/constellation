@@ -9,6 +9,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +36,7 @@ def person_key(person_name: str) -> str:
 
 
 def batch_id_for(companies: list[tuple[str, str]], model: str) -> str:
-    payload = json.dumps({"model": model, "tickers": [ticker for ticker, _ in companies]}, separators=(",", ":"))
+    payload = json.dumps({"model": model, "tickers": [ticker for ticker, _ in companies]}, ensure_ascii=False, separators=(",", ":"))
     return "grok_rel_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -122,7 +124,7 @@ def upsert_batch(connection: sqlite3.Connection, batch_id: str, tickers: list[st
             error_message = excluded.error_message,
             updated_at = excluded.updated_at
         """,
-        (batch_id, json.dumps(tickers), status, raw_request, raw_response, error_message, now, now),
+        (batch_id, json.dumps(tickers, ensure_ascii=False), status, raw_request, raw_response, error_message, now, now),
     )
 
 
@@ -175,10 +177,14 @@ def export_relationships_csv(connection: sqlite3.Connection) -> None:
 def write_debug(batch_id: str, raw_request: str, raw_response: str | None, error_message: str | None) -> None:
     DEBUG_BATCH_DIR.mkdir(parents=True, exist_ok=True)
     payload = {"batch_id": batch_id, "raw_request": raw_request, "raw_response": raw_response, "error_message": error_message}
-    (DEBUG_BATCH_DIR / f"{batch_id}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (DEBUG_BATCH_DIR / f"{batch_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Build raw company relationships with Grok API batches.")
     parser.add_argument("--universe", help="Filter companies by universe.")
     parser.add_argument("--ticker", help="Process one ticker.")
@@ -217,11 +223,12 @@ def main() -> None:
                 write_debug(batch_id, raw_request, raw_response, None)
                 print(f"Batch {index}/{len(company_batches)} complete: inserted/updated {len(rows)} relationship row(s).")
             except Exception as error:  # noqa: BLE001 - failure details must be persisted per batch.
-                message = str(error)
+                message = traceback.format_exc()
                 upsert_batch(connection, batch_id, tickers, "failed", raw_request, None, message)
                 connection.commit()
                 write_debug(batch_id, raw_request, None, message)
-                print(f"Batch {index}/{len(company_batches)} failed: {message}")
+                print(f"Batch {index}/{len(company_batches)} failed: {error}")
+                print(message, file=sys.stderr, end="")
 
 
 if __name__ == "__main__":
