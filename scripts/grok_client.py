@@ -4,8 +4,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Iterable
 
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_MODEL = "grok-4-fast-reasoning"
 BASE_URL = "https://api.x.ai/v1"
@@ -74,9 +79,10 @@ def build_user_prompt(companies: Iterable[tuple[str, str]]) -> str:
 
 def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str = DEFAULT_MODEL) -> str:
     """Call Grok with the fixed system prompt and return the raw JSON text."""
+    load_dotenv(PROJECT_ROOT / ".env")
     api_key = os.environ.get("GROK_API_KEY")
     if not api_key:
-        raise RuntimeError("GROK_API_KEY environment variable is required")
+        raise RuntimeError("GROK_API_KEY must be set in the environment or project .env file")
 
     user_prompt = build_user_prompt(companies)
     try:
