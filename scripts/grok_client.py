@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from dotenv import load_dotenv
 
@@ -70,6 +71,40 @@ Rules:
 Return only valid JSON."""
 
 
+def _format_header_value(name: str, value: str) -> str:
+    """Format a header for diagnostics without leaking bearer tokens."""
+    if name.lower() == "authorization" and value.startswith("Bearer "):
+        token = value.removeprefix("Bearer ")
+        value = f"Bearer <GROK_API_KEY length={len(token)}>"
+    return f"{name}: {value!r}"
+
+
+def _print_openai_client_headers(headers: Mapping[str, str]) -> None:
+    """Print the exact OpenAI client headers configured by this script."""
+    print("OpenAI client headers configured by scripts/grok_client.py:", file=sys.stderr)
+    for name, value in headers.items():
+        print(f"  {_format_header_value(name, value)}", file=sys.stderr)
+
+
+def _validate_ascii_headers(headers: Mapping[str, str]) -> None:
+    """Fail early with the offending header before httpx normalizes headers."""
+    for name, value in headers.items():
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError as error:
+            raise RuntimeError(
+                "OpenAI client header contains non-ASCII characters: "
+                f"{_format_header_value(name, value)}. httpx encodes header values "
+                "as ASCII while constructing the request headers; verify GROK_API_KEY "
+                "contains only the API key and not SYSTEM_PROMPT or other prompt text."
+            ) from error
+
+
+def _openai_client_headers(api_key: str) -> dict[str, str]:
+    """Return the only OpenAI client header explicitly configured here."""
+    return {"Authorization": f"Bearer {api_key}"}
+
+
 def build_user_prompt(companies: Iterable[tuple[str, str]]) -> str:
     """Build the per-batch user prompt from ticker/company name pairs."""
     lines = ["Process the following companies:"]
@@ -85,6 +120,9 @@ def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str =
         raise RuntimeError("GROK_API_KEY must be set in the environment or project .env file")
 
     user_prompt = build_user_prompt(companies)
+    headers = _openai_client_headers(api_key)
+    _print_openai_client_headers(headers)
+    _validate_ascii_headers(headers)
     try:
         from openai import OpenAI
     except ImportError as error:
