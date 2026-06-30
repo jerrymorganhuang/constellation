@@ -6,17 +6,17 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Iterable, Mapping
+import json
+from typing import Any, Iterable, Mapping, NamedTuple
 
 from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_MODEL = "grok-4-fast-reasoning"
+DEFAULT_MODEL = "grok-4.20-0309-reasoning"
 BASE_URL = "https://api.x.ai/v1"
 TEMPERATURE = 0
-MAX_TOKENS = 8000
 
 SYSTEM_PROMPT = """You are building a high-quality company relationship dataset.
 
@@ -147,8 +147,91 @@ def build_user_prompt(companies: Iterable[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str = DEFAULT_MODEL) -> str:
-    """Call Grok with the fixed system prompt and return the raw JSON text."""
+
+class GrokUsageMetadata(NamedTuple):
+    """Usage and response metadata returned by the Responses API."""
+
+    response_id: str | None
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    cached_input_tokens: int | None
+    usage_json: str | None
+
+
+class GrokExtractionResult(NamedTuple):
+    """Raw extraction output plus API usage metadata."""
+
+    raw_response: str
+    metadata: GrokUsageMetadata
+
+
+def _as_dict(value: Any) -> dict[str, Any] | None:
+    """Best-effort conversion of SDK response objects to dictionaries."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    for method_name in ("model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                result = method()
+            except TypeError:
+                result = method
+            if isinstance(result, dict):
+                return result
+    return None
+
+
+def _get_value(value: Any, *names: str) -> Any:
+    """Read the first available attribute/key from an SDK object or dict."""
+    value_dict = _as_dict(value)
+    for name in names:
+        if value_dict is not None and name in value_dict:
+            return value_dict[name]
+        if hasattr(value, name):
+            return getattr(value, name)
+    return None
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_json(usage: Any) -> str | None:
+    usage_dict = _as_dict(usage)
+    if usage_dict is None:
+        return None
+    return json.dumps(usage_dict, ensure_ascii=False, sort_keys=True)
+
+
+def _extract_usage_metadata(response: Any, requested_model: str) -> GrokUsageMetadata:
+    usage = _get_value(response, "usage")
+    input_tokens = _to_int(_get_value(usage, "input_tokens", "prompt_tokens"))
+    output_tokens = _to_int(_get_value(usage, "output_tokens", "completion_tokens"))
+    total_tokens = _to_int(_get_value(usage, "total_tokens"))
+    input_details = _get_value(usage, "input_tokens_details", "prompt_tokens_details")
+    cached_input_tokens = _to_int(_get_value(input_details, "cached_tokens", "cached_input_tokens"))
+    return GrokUsageMetadata(
+        response_id=_get_value(response, "id", "response_id"),
+        model=_get_value(response, "model") or requested_model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cached_input_tokens=cached_input_tokens,
+        usage_json=_usage_json(usage),
+    )
+
+
+def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str = DEFAULT_MODEL) -> GrokExtractionResult:
+    """Call Grok with the fixed system prompt and return raw JSON text plus metadata."""
     load_dotenv(PROJECT_ROOT / ".env", override=True)
     api_key = os.environ.get("GROK_API_KEY")
     if not api_key:
@@ -172,6 +255,5 @@ def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str =
         ],
         tools=[{"type": "web_search"}],
         temperature=TEMPERATURE,
-        max_output_tokens=MAX_TOKENS,
     )
-    return response.output_text
+    return GrokExtractionResult(response.output_text, _extract_usage_metadata(response, model))

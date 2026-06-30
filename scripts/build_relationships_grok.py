@@ -24,6 +24,8 @@ RELATIONSHIPS_CSV_PATH = DATA_DIR / "relationships_raw.csv"
 DEBUG_BATCH_DIR = DATA_DIR / "debug" / "grok_relationship_batches"
 EXTRACTION_METHOD = "grok_api"
 VALID_ROLE_CATEGORIES = {"EXECUTIVE", "BOARD"}
+INPUT_COST_PER_1M_TOKENS = 1.25
+OUTPUT_COST_PER_1M_TOKENS = 2.50
 
 
 def utc_now() -> str:
@@ -77,7 +79,25 @@ def create_tables(connection: sqlite3.Connection) -> None:
         ON relationships_raw (ticker, person_key, role, role_category);
         """
     )
+    ensure_relationship_batch_usage_columns(connection)
     connection.commit()
+
+
+def ensure_relationship_batch_usage_columns(connection: sqlite3.Connection) -> None:
+    existing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(relationship_batches)").fetchall()}
+    columns = {
+        "response_id": "TEXT",
+        "model": "TEXT",
+        "input_tokens": "INTEGER",
+        "output_tokens": "INTEGER",
+        "total_tokens": "INTEGER",
+        "cached_input_tokens": "INTEGER",
+        "cost_usd": "REAL",
+        "usage_json": "TEXT",
+    }
+    for column_name, column_type in columns.items():
+        if column_name not in existing_columns:
+            connection.execute(f"ALTER TABLE relationship_batches ADD COLUMN {column_name} {column_type}")
 
 
 def fetch_companies(connection: sqlite3.Connection, universe: str | None, ticker: str | None, limit: int | None) -> list[tuple[str, str]]:
@@ -110,22 +130,75 @@ def is_completed(connection: sqlite3.Connection, batch_id: str) -> bool:
     return bool(row and row["status"] == "success")
 
 
-def upsert_batch(connection: sqlite3.Connection, batch_id: str, tickers: list[str], status: str, raw_request: str, raw_response: str | None, error_message: str | None) -> None:
+def upsert_batch(
+    connection: sqlite3.Connection,
+    batch_id: str,
+    tickers: list[str],
+    status: str,
+    raw_request: str,
+    raw_response: str | None,
+    error_message: str | None,
+    metadata: Any | None = None,
+    cost_usd: float | None = None,
+) -> None:
     now = utc_now()
     connection.execute(
         """
-        INSERT INTO relationship_batches (batch_id, tickers, status, raw_request, raw_response, error_message, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO relationship_batches (
+            batch_id, tickers, status, raw_request, raw_response, error_message,
+            response_id, model, input_tokens, output_tokens, total_tokens, cached_input_tokens, cost_usd, usage_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(batch_id) DO UPDATE SET
             tickers = excluded.tickers,
             status = excluded.status,
             raw_request = excluded.raw_request,
             raw_response = excluded.raw_response,
             error_message = excluded.error_message,
+            response_id = excluded.response_id,
+            model = excluded.model,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            total_tokens = excluded.total_tokens,
+            cached_input_tokens = excluded.cached_input_tokens,
+            cost_usd = excluded.cost_usd,
+            usage_json = excluded.usage_json,
             updated_at = excluded.updated_at
         """,
-        (batch_id, json.dumps(tickers, ensure_ascii=False), status, raw_request, raw_response, error_message, now, now),
+        (
+            batch_id,
+            json.dumps(tickers, ensure_ascii=False),
+            status,
+            raw_request,
+            raw_response,
+            error_message,
+            getattr(metadata, "response_id", None),
+            getattr(metadata, "model", None),
+            getattr(metadata, "input_tokens", None),
+            getattr(metadata, "output_tokens", None),
+            getattr(metadata, "total_tokens", None),
+            getattr(metadata, "cached_input_tokens", None),
+            cost_usd,
+            getattr(metadata, "usage_json", None),
+            now,
+            now,
+        ),
     )
+
+
+def calculate_cost_usd(input_tokens: int | None, output_tokens: int | None) -> float | None:
+    if input_tokens is None or output_tokens is None:
+        return None
+    return input_tokens * INPUT_COST_PER_1M_TOKENS / 1_000_000 + output_tokens * OUTPUT_COST_PER_1M_TOKENS / 1_000_000
+
+
+def format_metric(value: int | float | None) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
 
 
 def parse_relationships(raw_response: str) -> list[dict[str, str]]:
@@ -202,6 +275,11 @@ def main() -> None:
         create_tables(connection)
         companies = fetch_companies(connection, args.universe, args.ticker, args.limit)
         company_batches = chunks(companies, args.batch_size)
+        total_relationships = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_tokens = 0
+        total_cost_usd = 0.0
         print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es).")
         for index, batch in enumerate(company_batches, start=1):
             batch_id = batch_id_for(batch, args.model)
@@ -214,14 +292,31 @@ def main() -> None:
             if args.dry_run:
                 continue
             try:
-                raw_response = extract_relationships_raw(batch, model=args.model)
+                result = extract_relationships_raw(batch, model=args.model)
+                raw_response = result.raw_response
+                metadata = result.metadata
+                cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
                 rows = parse_relationships(raw_response)
                 insert_relationships(connection, rows, batch_id)
-                upsert_batch(connection, batch_id, tickers, "success", raw_request, raw_response, None)
+                upsert_batch(connection, batch_id, tickers, "success", raw_request, raw_response, None, metadata, cost_usd)
                 connection.commit()
                 export_relationships_csv(connection)
                 write_debug(batch_id, raw_request, raw_response, None)
-                print(f"Batch {index}/{len(company_batches)} complete: inserted/updated {len(rows)} relationship row(s).")
+                total_relationships += len(rows)
+                if metadata.input_tokens is not None:
+                    total_input_tokens += metadata.input_tokens
+                if metadata.output_tokens is not None:
+                    total_output_tokens += metadata.output_tokens
+                if metadata.total_tokens is not None:
+                    total_tokens += metadata.total_tokens
+                if cost_usd is not None:
+                    total_cost_usd += cost_usd
+                print(
+                    f"Batch {index}/{len(company_batches)} {batch_id}: {', '.join(tickers)}\n"
+                    f"relationships={len(rows)}, input_tokens={format_metric(metadata.input_tokens)}, "
+                    f"output_tokens={format_metric(metadata.output_tokens)}, "
+                    f"total_tokens={format_metric(metadata.total_tokens)}, cost_usd={format_metric(cost_usd)}"
+                )
             except Exception as error:  # noqa: BLE001 - failure details must be persisted per batch.
                 message = traceback.format_exc()
                 upsert_batch(connection, batch_id, tickers, "failed", raw_request, None, message)
@@ -229,6 +324,12 @@ def main() -> None:
                 write_debug(batch_id, raw_request, None, message)
                 print(f"Batch {index}/{len(company_batches)} failed: {error}")
                 print(message, file=sys.stderr, end="")
+        print("Final run summary:")
+        print(f"Total relationships: {total_relationships}")
+        print(f"Total input tokens: {total_input_tokens}")
+        print(f"Total output tokens: {total_output_tokens}")
+        print(f"Total tokens: {total_tokens}")
+        print(f"Total estimated cost USD: {total_cost_usd:.6f}")
 
 
 if __name__ == "__main__":
