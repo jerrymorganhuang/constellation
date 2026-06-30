@@ -129,17 +129,14 @@ def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str =
         raise RuntimeError("The openai package is required to call the Grok API") from error
 
     client = OpenAI(api_key=api_key, base_url=BASE_URL)
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[
+        input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
+        tools=[{"type": "web_search"}],
         temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-        extra_body={"cache_prompt": True},
+        max_output_tokens=MAX_TOKENS,
     )
-    content = response.choices[0].message.content
-    if content is None:
-        raise RuntimeError("Grok API returned an empty response")
-    return content
+    return response.output_text
