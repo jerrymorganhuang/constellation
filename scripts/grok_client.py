@@ -114,7 +114,7 @@ def build_user_prompt(companies: Iterable[tuple[str, str]]) -> str:
 
 def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str = DEFAULT_MODEL) -> str:
     """Call Grok with the fixed system prompt and return the raw JSON text."""
-    load_dotenv(PROJECT_ROOT / ".env")
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
     api_key = os.environ.get("GROK_API_KEY")
     if not api_key:
         raise RuntimeError("GROK_API_KEY must be set in the environment or project .env file")
