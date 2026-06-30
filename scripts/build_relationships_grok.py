@@ -189,7 +189,7 @@ def main() -> None:
     parser.add_argument("--universe", help="Filter companies by universe.")
     parser.add_argument("--ticker", help="Process one ticker.")
     parser.add_argument("--limit", type=int, help="Limit number of companies processed.")
-    parser.add_argument("--batch-size", type=int, default=10, help="Companies per Grok request.")
+    parser.add_argument("--batch-size", type=int, default=5, help="Companies per Grok request.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Grok model name.")
     parser.add_argument("--resume", action="store_true", help="Skip batches already marked success.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned batches without calling Grok.")
