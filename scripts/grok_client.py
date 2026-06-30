@@ -18,13 +18,28 @@ BASE_URL = "https://api.x.ai/v1"
 TEMPERATURE = 0
 MAX_TOKENS = 8000
 
-SYSTEM_PROMPT = """You are building a company relationship dataset.
+SYSTEM_PROMPT = """You are building a high-quality company relationship dataset.
 
-For each company below, identify all current members of the company's official Executive Team / Management Team / Leadership Team / Senior Leadership, and all current members of the Board of Directors.
+Your task is to identify the CURRENT executive leadership team and board of directors for every company provided by the user.
 
-Output strict JSON only.
+Use ONLY official company sources whenever possible.
+
+Search official sources in the following priority order:
+
+1. Leadership / Management page
+2. Investor Relations website
+3. Corporate Governance page
+4. Proxy Statement (DEF 14A)
+5. Annual Report
+
+Use web search to locate these sources.
+
+Your objective is to maximize recall while maintaining reasonable precision.
+
+Return STRICT JSON only.
 
 JSON schema:
+
 {
   "companies": [
     {
@@ -32,7 +47,7 @@ JSON schema:
       "relationships": [
         {
           "person_name": "Jensen Huang",
-          "role": "CEO",
+          "role": "President and Chief Executive Officer",
           "role_category": "EXECUTIVE"
         },
         {
@@ -45,30 +60,50 @@ JSON schema:
   ]
 }
 
-Rules:
-1. role_category must be only EXECUTIVE or BOARD.
+Requirements
 
-2. For executives:
-   - CEO / Chief Executive Officer / President and CEO should be standardized as CEO.
-   - CFO / Chief Financial Officer should be standardized as CFO.
-   - All other executive roles should keep the company's official title as closely as possible.
+1. Return exactly one company object for every ticker provided.
 
-3. For board members:
-   - Chairman / Chair of the Board / Executive Chairman / Independent Chairman should be standardized as Chairman.
-   - All other board members should have role = Director.
-   - Do not use Founder, Independent Director, Lead Director, or committee roles as role.
+2. For each company, identify every CURRENT member of the official:
+   - Executive Team
+   - Management Team
+   - Leadership Team
+   - Senior Leadership
+   - Board of Directors
 
-4. A person can appear twice if they are both an executive and a board member.
+3. If no current leadership or board members can be identified after searching official company sources, return the company with:
 
-5. Do not include former executives or former directors.
+   "relationships": []
 
-6. Do not include advisors, observers, founders without current executive or board role, or committee-only roles.
+4. role_category must be exactly one of:
+   - EXECUTIVE
+   - BOARD
 
-7. Do not add explanations, markdown, citations, notes, or blank lines.
+5. Preserve each person's official job title exactly as shown on the official company source.
 
-8. If uncertain, omit the row.
+6. Do not standardize, simplify, abbreviate, or reinterpret job titles.
 
-Return only valid JSON."""
+7. A person may appear multiple times if they currently hold multiple qualifying roles.
+
+8. Include only CURRENT executives and CURRENT directors.
+
+9. Exclude:
+   - Former executives
+   - Former directors
+   - Advisors
+   - Observers
+   - Committee memberships by themselves
+   - Honorary titles
+   - Founders without a current executive or board position
+
+10. If one individual cannot be verified, omit only that individual. Never omit the rest of the company.
+
+11. Before returning the final JSON, verify that the executive team and board of directors appear reasonably complete based on the official company sources you found. If the results appear incomplete, continue searching before returning your answer.
+
+Return only valid JSON.
+
+Do not include explanations, markdown, citations, comments, or any text outside the JSON.
+"""
 
 
 def _format_header_value(name: str, value: str) -> str:
