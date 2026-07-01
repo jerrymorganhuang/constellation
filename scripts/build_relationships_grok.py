@@ -338,7 +338,7 @@ def main() -> None:
                     metadata = result.metadata
                     response_json = result.response_json
                     cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
-                    error_message = "Grok returned empty output_text"
+                    error_message = "Grok returned no final text"
                     upsert_batch(connection, batch_id, tickers, "failed", raw_request, raw_response, error_message, metadata, cost_usd)
                     connection.commit()
                     write_debug(batch_id, raw_request, raw_response, error_message, response_json)
@@ -357,7 +357,26 @@ def main() -> None:
                 metadata = result.metadata
                 response_json = result.response_json
                 cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
-                rows, returned_tickers = parse_relationships(raw_response)
+                try:
+                    rows, returned_tickers = parse_relationships(raw_response)
+                except json.JSONDecodeError as error:
+                    preview = raw_response[:500].replace("\n", "\\n")
+                    error_message = f"invalid_json: {error}; raw_response_preview={preview!r}"
+                    upsert_batch(connection, batch_id, tickers, "failed", raw_request, raw_response, error_message, metadata, cost_usd)
+                    connection.commit()
+                    write_debug(batch_id, raw_request, raw_response, error_message, response_json)
+                    failed_batches += 1
+                    failed_company_count += len(tickers)
+                    if metadata.input_tokens is not None:
+                        total_input_tokens += metadata.input_tokens
+                    if metadata.output_tokens is not None:
+                        total_output_tokens += metadata.output_tokens
+                    if metadata.total_tokens is not None:
+                        total_tokens += metadata.total_tokens
+                    if cost_usd is not None:
+                        total_cost_usd += cost_usd
+                    print(f"Batch {index}/{len(company_batches)} failed: invalid_json")
+                    continue
                 missing_tickers = sorted(set(tickers) - returned_tickers)
                 status = "partial" if missing_tickers else "success"
                 error_message = f"Missing tickers: {', '.join(missing_tickers)}" if missing_tickers else None

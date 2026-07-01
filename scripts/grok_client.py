@@ -197,6 +197,69 @@ def _get_value(value: Any, *names: str) -> Any:
     return None
 
 
+
+def _non_empty_string(value: Any) -> str | None:
+    """Return string values with non-whitespace content, otherwise None."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _iter_items(value: Any) -> list[Any]:
+    """Return list-like response fields as a plain list for SDK and dict shapes."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def extract_final_text(response: Any) -> str | None:
+    """Extract final assistant text from Responses API SDK/dict response shapes."""
+    output_text = _non_empty_string(_get_value(response, "output_text"))
+    if output_text is not None:
+        return output_text
+
+    fallback_parts: list[str] = []
+    for item in _iter_items(_get_value(response, "output")):
+        item_type = _get_value(item, "type")
+        if item_type != "message":
+            continue
+        role = _get_value(item, "role")
+        if role is not None and role != "assistant":
+            continue
+        for part in _iter_items(_get_value(item, "content")):
+            if _get_value(part, "type") != "output_text":
+                continue
+            text = _non_empty_string(_get_value(part, "text"))
+            if text is not None:
+                fallback_parts.append(text)
+
+    if fallback_parts:
+        return "\n".join(fallback_parts)
+    return None
+
+
+def _final_text_extraction_method(response: Any, final_text: str | None) -> str | None:
+    """Identify which Responses API field supplied the extracted final text."""
+    if final_text is None:
+        return None
+    if _non_empty_string(_get_value(response, "output_text")) is not None:
+        return "output_text"
+    return "output_fallback"
+
+
+def _output_item_types(response: Any) -> list[str]:
+    """Return response.output item types for lightweight diagnostics."""
+    item_types: list[str] = []
+    for item in _iter_items(_get_value(response, "output")):
+        item_type = _get_value(item, "type")
+        if item_type is not None:
+            item_types.append(str(item_type))
+    return item_types
+
 def _to_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -206,9 +269,13 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
-def _usage_json(usage: Any) -> str | None:
+def _usage_json(usage: Any, debug_metadata: Mapping[str, Any] | None = None) -> str | None:
     usage_dict = _as_dict(usage)
     if usage_dict is None:
+        usage_dict = {}
+    if debug_metadata:
+        usage_dict.update({key: value for key, value in debug_metadata.items() if value is not None})
+    if not usage_dict:
         return None
     return json.dumps(usage_dict, ensure_ascii=False, sort_keys=True)
 
@@ -229,7 +296,7 @@ def _response_json(response: Any) -> str | None:
     return None
 
 
-def _extract_usage_metadata(response: Any, requested_model: str) -> GrokUsageMetadata:
+def _extract_usage_metadata(response: Any, requested_model: str, final_text: str | None = None) -> GrokUsageMetadata:
     usage = _get_value(response, "usage")
     input_tokens = _to_int(_get_value(usage, "input_tokens", "prompt_tokens"))
     output_tokens = _to_int(_get_value(usage, "output_tokens", "completion_tokens"))
@@ -243,7 +310,15 @@ def _extract_usage_metadata(response: Any, requested_model: str) -> GrokUsageMet
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         cached_input_tokens=cached_input_tokens,
-        usage_json=_usage_json(usage),
+        usage_json=_usage_json(
+            usage,
+            {
+                "extraction_method": _final_text_extraction_method(response, final_text),
+                "extracted_text_len": len(final_text) if final_text is not None else None,
+                "response_status": _get_value(response, "status"),
+                "output_item_types": _output_item_types(response),
+            },
+        ),
     )
 
 
@@ -273,4 +348,5 @@ def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str =
         tools=[{"type": "web_search"}],
         temperature=TEMPERATURE,
     )
-    return GrokExtractionResult(response.output_text, _extract_usage_metadata(response, model), _response_json(response))
+    final_text = extract_final_text(response)
+    return GrokExtractionResult(final_text, _extract_usage_metadata(response, model, final_text), _response_json(response))
