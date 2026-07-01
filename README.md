@@ -24,6 +24,15 @@ python scripts/build_companies.py
 
 The script fetches universe membership from documented rule-based public sources in `data/universes/sources.yml`, enriches company name, sector, industry, and description with `yfinance`, derives a deterministic short description, rebuilds the `companies` table in SQLite, exports `data/companies.csv`, writes `data/universe_audit.json`, and validates the generated outputs. Missing yfinance metadata is left blank/null. Source fetch failures are reported as skipped universes; the build completes as long as at least one universe is loaded and never falls back to undocumented local universe files.
 
+Build raw relationship rows from the Company Master universe with Grok batches:
+
+```bash
+python scripts/build_relationships_grok.py --offset 0 --limit 30 --dry-run
+python scripts/build_relationships_grok.py --offset 30 --limit 30 --dry-run
+```
+
+`--offset` skips companies from the ordered Company Master list before `--limit` is applied, so `--limit` remains the number of companies processed in that slice.
+
 SQLite schema:
 
 ```sql

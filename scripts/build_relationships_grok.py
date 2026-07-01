@@ -101,7 +101,7 @@ def ensure_relationship_batch_usage_columns(connection: sqlite3.Connection) -> N
             connection.execute(f"ALTER TABLE relationship_batches ADD COLUMN {column_name} {column_type}")
 
 
-def fetch_companies(connection: sqlite3.Connection, universe: str | None, ticker: str | None, limit: int | None) -> list[tuple[str, str]]:
+def fetch_companies(connection: sqlite3.Connection, universe: str | None, ticker: str | None) -> list[tuple[str, str]]:
     where: list[str] = []
     params: list[Any] = []
     if universe:
@@ -115,9 +115,6 @@ def fetch_companies(connection: sqlite3.Connection, universe: str | None, ticker
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " GROUP BY ticker, company_name ORDER BY ticker"
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
     rows = connection.execute(sql, params).fetchall()
     return [(str(row["ticker"]), str(row["company_name"])) for row in rows]
 
@@ -292,7 +289,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build raw company relationships with Grok API batches.")
     parser.add_argument("--universe", help="Filter companies by universe.")
     parser.add_argument("--ticker", help="Process one ticker.")
-    parser.add_argument("--limit", type=int, help="Limit number of companies processed.")
+    parser.add_argument("--limit", type=int, help="Limit number of companies processed after offset.")
+    parser.add_argument("--offset", type=int, default=0, help="Number of companies to skip before applying limit.")
     parser.add_argument("--batch-size", type=int, default=5, help="Companies per Grok request.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Grok model name.")
     parser.add_argument("--resume", action="store_true", help="Skip batches already marked success.")
@@ -301,10 +299,15 @@ def main() -> None:
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.offset < 0:
+        raise ValueError("--offset must be non-negative")
 
     with connect() as connection:
         create_tables(connection)
-        companies = fetch_companies(connection, args.universe, args.ticker, args.limit)
+        companies = fetch_companies(connection, args.universe, args.ticker)
+        companies = companies[args.offset :]
+        if args.limit is not None:
+            companies = companies[: args.limit]
         company_batches = chunks(companies, args.batch_size)
         total_relationships = 0
         total_input_tokens = 0
@@ -317,7 +320,7 @@ def main() -> None:
         missing_ticker_count = 0
         failed_company_count = 0
         initialize_missing_companies_csv()
-        print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es).")
+        print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es) with offset={args.offset}, limit={args.limit}.")
         for index, batch in enumerate(company_batches, start=1):
             batch_id = batch_id_for(batch, args.model)
             tickers = [ticker for ticker, _ in batch]
