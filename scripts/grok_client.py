@@ -161,10 +161,11 @@ class GrokUsageMetadata(NamedTuple):
 
 
 class GrokExtractionResult(NamedTuple):
-    """Raw extraction output plus API usage metadata."""
+    """Raw extraction output plus API usage metadata and response diagnostics."""
 
-    raw_response: str
+    raw_response: str | None
     metadata: GrokUsageMetadata
+    response_json: str | None
 
 
 def _as_dict(value: Any) -> dict[str, Any] | None:
@@ -212,6 +213,22 @@ def _usage_json(usage: Any) -> str | None:
     return json.dumps(usage_dict, ensure_ascii=False, sort_keys=True)
 
 
+def _response_json(response: Any) -> str | None:
+    """Return the full SDK response object as JSON for debug capture when possible."""
+    if response is None:
+        return None
+    model_dump_json = getattr(response, "model_dump_json", None)
+    if callable(model_dump_json):
+        try:
+            return model_dump_json(indent=2)
+        except TypeError:
+            return model_dump_json()
+    response_dict = _as_dict(response)
+    if response_dict is not None:
+        return json.dumps(response_dict, ensure_ascii=False, indent=2)
+    return None
+
+
 def _extract_usage_metadata(response: Any, requested_model: str) -> GrokUsageMetadata:
     usage = _get_value(response, "usage")
     input_tokens = _to_int(_get_value(usage, "input_tokens", "prompt_tokens"))
@@ -256,4 +273,4 @@ def extract_relationships_raw(companies: Iterable[tuple[str, str]], model: str =
         tools=[{"type": "web_search"}],
         temperature=TEMPERATURE,
     )
-    return GrokExtractionResult(response.output_text, _extract_usage_metadata(response, model))
+    return GrokExtractionResult(response.output_text, _extract_usage_metadata(response, model), _response_json(response))
