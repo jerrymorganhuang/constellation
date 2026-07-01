@@ -315,6 +315,7 @@ def main() -> None:
         partial_batches = 0
         failed_batches = 0
         missing_ticker_count = 0
+        failed_company_count = 0
         initialize_missing_companies_csv()
         print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es).")
         for index, batch in enumerate(company_batches, start=1):
@@ -330,15 +331,16 @@ def main() -> None:
             try:
                 result = extract_relationships_raw(batch, model=args.model)
                 raw_response = result.raw_response
-                metadata = result.metadata
-                response_json = result.response_json
-                cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
                 if raw_response is None or raw_response.strip() == "":
+                    metadata = result.metadata
+                    response_json = result.response_json
+                    cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
                     error_message = "Grok returned empty output_text"
                     upsert_batch(connection, batch_id, tickers, "failed", raw_request, raw_response, error_message, metadata, cost_usd)
                     connection.commit()
                     write_debug(batch_id, raw_request, raw_response, error_message, response_json)
                     failed_batches += 1
+                    failed_company_count += len(tickers)
                     if metadata.input_tokens is not None:
                         total_input_tokens += metadata.input_tokens
                     if metadata.output_tokens is not None:
@@ -349,6 +351,9 @@ def main() -> None:
                         total_cost_usd += cost_usd
                     print(f"Batch {index}/{len(company_batches)} {batch_id} failed: {error_message}")
                     continue
+                metadata = result.metadata
+                response_json = result.response_json
+                cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
                 rows, returned_tickers = parse_relationships(raw_response)
                 missing_tickers = sorted(set(tickers) - returned_tickers)
                 status = "partial" if missing_tickers else "success"
@@ -386,12 +391,14 @@ def main() -> None:
                 connection.commit()
                 write_debug(batch_id, raw_request, None, message)
                 failed_batches += 1
+                failed_company_count += len(tickers)
                 print(f"Batch {index}/{len(company_batches)} failed: {error}")
                 print(message, file=sys.stderr, end="")
         print("Final run summary:")
         print(f"Successful batches: {successful_batches}")
         print(f"Partial batches: {partial_batches}")
         print(f"Failed batches: {failed_batches}")
+        print(f"Failed company count: {failed_company_count}")
         print(f"Missing ticker count: {missing_ticker_count}")
         print(f"Total relationships: {total_relationships}")
         print(f"Total input tokens: {total_input_tokens}")
