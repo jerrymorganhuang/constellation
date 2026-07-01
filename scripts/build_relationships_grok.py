@@ -266,9 +266,21 @@ def append_missing_companies_csv(missing_tickers: list[str], batch_id: str) -> N
         writer = csv.writer(handle)
         writer.writerows((ticker, batch_id, "missing_from_response", created_at) for ticker in missing_tickers)
 
-def write_debug(batch_id: str, raw_request: str, raw_response: str | None, error_message: str | None) -> None:
+def write_debug(
+    batch_id: str,
+    raw_request: str,
+    raw_response: str | None,
+    error_message: str | None,
+    response_json: str | None = None,
+) -> None:
     DEBUG_BATCH_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"batch_id": batch_id, "raw_request": raw_request, "raw_response": raw_response, "error_message": error_message}
+    payload = {
+        "batch_id": batch_id,
+        "raw_request": raw_request,
+        "raw_response": raw_response,
+        "response_json": response_json,
+        "error_message": error_message,
+    }
     (DEBUG_BATCH_DIR / f"{batch_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -319,7 +331,24 @@ def main() -> None:
                 result = extract_relationships_raw(batch, model=args.model)
                 raw_response = result.raw_response
                 metadata = result.metadata
+                response_json = result.response_json
                 cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
+                if raw_response is None or raw_response.strip() == "":
+                    error_message = "Grok returned empty output_text"
+                    upsert_batch(connection, batch_id, tickers, "failed", raw_request, raw_response, error_message, metadata, cost_usd)
+                    connection.commit()
+                    write_debug(batch_id, raw_request, raw_response, error_message, response_json)
+                    failed_batches += 1
+                    if metadata.input_tokens is not None:
+                        total_input_tokens += metadata.input_tokens
+                    if metadata.output_tokens is not None:
+                        total_output_tokens += metadata.output_tokens
+                    if metadata.total_tokens is not None:
+                        total_tokens += metadata.total_tokens
+                    if cost_usd is not None:
+                        total_cost_usd += cost_usd
+                    print(f"Batch {index}/{len(company_batches)} {batch_id} failed: {error_message}")
+                    continue
                 rows, returned_tickers = parse_relationships(raw_response)
                 missing_tickers = sorted(set(tickers) - returned_tickers)
                 status = "partial" if missing_tickers else "success"
@@ -328,7 +357,7 @@ def main() -> None:
                 upsert_batch(connection, batch_id, tickers, status, raw_request, raw_response, error_message, metadata, cost_usd)
                 connection.commit()
                 export_relationships_csv(connection)
-                write_debug(batch_id, raw_request, raw_response, None)
+                write_debug(batch_id, raw_request, raw_response, None, response_json)
                 append_missing_companies_csv(missing_tickers, batch_id)
                 if status == "partial":
                     partial_batches += 1
