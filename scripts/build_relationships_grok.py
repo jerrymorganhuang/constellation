@@ -21,6 +21,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "constellation.db"
 RELATIONSHIPS_CSV_PATH = DATA_DIR / "relationships_raw.csv"
+MISSING_COMPANIES_CSV_PATH = DATA_DIR / "missing_companies.csv"
 DEBUG_BATCH_DIR = DATA_DIR / "debug" / "grok_relationship_batches"
 EXTRACTION_METHOD = "grok_api"
 VALID_ROLE_CATEGORIES = {"EXECUTIVE", "BOARD"}
@@ -201,11 +202,14 @@ def format_metric(value: int | float | None) -> str:
     return str(value)
 
 
-def parse_relationships(raw_response: str) -> list[dict[str, str]]:
+def parse_relationships(raw_response: str) -> tuple[list[dict[str, str]], set[str]]:
     payload = json.loads(raw_response)
     rows: list[dict[str, str]] = []
+    returned_tickers: set[str] = set()
     for company in payload.get("companies", []):
         ticker = str(company.get("ticker", "")).strip().upper()
+        if ticker:
+            returned_tickers.add(ticker)
         for relationship in company.get("relationships", []):
             name = str(relationship.get("person_name", "")).strip()
             role = str(relationship.get("role", "")).strip()
@@ -213,7 +217,7 @@ def parse_relationships(raw_response: str) -> list[dict[str, str]]:
             if not ticker or not name or not role or role_category not in VALID_ROLE_CATEGORIES:
                 continue
             rows.append({"ticker": ticker, "person_name": name, "person_key": person_key(name), "role": role, "role_category": role_category})
-    return rows
+    return rows, returned_tickers
 
 
 def insert_relationships(connection: sqlite3.Connection, rows: list[dict[str, str]], batch_id: str) -> None:
@@ -246,6 +250,21 @@ def export_relationships_csv(connection: sqlite3.Connection) -> None:
         writer.writerow(["id", "ticker", "person_name", "person_key", "role", "role_category", "batch_id", "extraction_method", "created_at", "updated_at"])
         writer.writerows([tuple(row) for row in rows])
 
+
+def initialize_missing_companies_csv() -> None:
+    MISSING_COMPANIES_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with MISSING_COMPANIES_CSV_PATH.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["ticker", "batch_id", "reason", "created_at"])
+
+
+def append_missing_companies_csv(missing_tickers: list[str], batch_id: str) -> None:
+    if not missing_tickers:
+        return
+    created_at = utc_now()
+    with MISSING_COMPANIES_CSV_PATH.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerows((ticker, batch_id, "missing_from_response", created_at) for ticker in missing_tickers)
 
 def write_debug(batch_id: str, raw_request: str, raw_response: str | None, error_message: str | None) -> None:
     DEBUG_BATCH_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,6 +299,11 @@ def main() -> None:
         total_output_tokens = 0
         total_tokens = 0
         total_cost_usd = 0.0
+        successful_batches = 0
+        partial_batches = 0
+        failed_batches = 0
+        missing_ticker_count = 0
+        initialize_missing_companies_csv()
         print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es).")
         for index, batch in enumerate(company_batches, start=1):
             batch_id = batch_id_for(batch, args.model)
@@ -296,12 +320,21 @@ def main() -> None:
                 raw_response = result.raw_response
                 metadata = result.metadata
                 cost_usd = calculate_cost_usd(metadata.input_tokens, metadata.output_tokens)
-                rows = parse_relationships(raw_response)
+                rows, returned_tickers = parse_relationships(raw_response)
+                missing_tickers = sorted(set(tickers) - returned_tickers)
+                status = "partial" if missing_tickers else "success"
+                error_message = f"Missing tickers: {', '.join(missing_tickers)}" if missing_tickers else None
                 insert_relationships(connection, rows, batch_id)
-                upsert_batch(connection, batch_id, tickers, "success", raw_request, raw_response, None, metadata, cost_usd)
+                upsert_batch(connection, batch_id, tickers, status, raw_request, raw_response, error_message, metadata, cost_usd)
                 connection.commit()
                 export_relationships_csv(connection)
                 write_debug(batch_id, raw_request, raw_response, None)
+                append_missing_companies_csv(missing_tickers, batch_id)
+                if status == "partial":
+                    partial_batches += 1
+                    missing_ticker_count += len(missing_tickers)
+                else:
+                    successful_batches += 1
                 total_relationships += len(rows)
                 if metadata.input_tokens is not None:
                     total_input_tokens += metadata.input_tokens
@@ -313,7 +346,8 @@ def main() -> None:
                     total_cost_usd += cost_usd
                 print(
                     f"Batch {index}/{len(company_batches)} {batch_id}: {', '.join(tickers)}\n"
-                    f"relationships={len(rows)}, input_tokens={format_metric(metadata.input_tokens)}, "
+                    f"status={status}, relationships={len(rows)}, missing_tickers={len(missing_tickers)}, "
+                    f"input_tokens={format_metric(metadata.input_tokens)}, "
                     f"output_tokens={format_metric(metadata.output_tokens)}, "
                     f"total_tokens={format_metric(metadata.total_tokens)}, cost_usd={format_metric(cost_usd)}"
                 )
@@ -322,9 +356,14 @@ def main() -> None:
                 upsert_batch(connection, batch_id, tickers, "failed", raw_request, None, message)
                 connection.commit()
                 write_debug(batch_id, raw_request, None, message)
+                failed_batches += 1
                 print(f"Batch {index}/{len(company_batches)} failed: {error}")
                 print(message, file=sys.stderr, end="")
         print("Final run summary:")
+        print(f"Successful batches: {successful_batches}")
+        print(f"Partial batches: {partial_batches}")
+        print(f"Failed batches: {failed_batches}")
+        print(f"Missing ticker count: {missing_ticker_count}")
         print(f"Total relationships: {total_relationships}")
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
