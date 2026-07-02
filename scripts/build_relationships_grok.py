@@ -199,8 +199,31 @@ def format_metric(value: int | float | None) -> str:
     return str(value)
 
 
+def normalize_json_response(raw_response: str) -> str:
+    """Return model JSON text, accepting optional Markdown code fences.
+
+    Grok usually follows the prompt and returns a bare JSON object, but some
+    otherwise-valid batches have been observed wrapped in a fenced code block
+    such as ```json ... ```. json.loads() fails on the opening backtick, so
+    unwrap only when the entire response is a single fenced block.
+    """
+    text = raw_response.strip()
+    if not text.startswith("```"):
+        return text
+
+    lines = text.splitlines()
+    if len(lines) < 3 or not lines[0].startswith("```") or lines[-1].strip() != "```":
+        return text
+
+    fence_language = lines[0][3:].strip().lower()
+    if fence_language not in {"", "json"}:
+        return text
+
+    return "\n".join(lines[1:-1]).strip()
+
+
 def parse_relationships(raw_response: str) -> tuple[list[dict[str, str]], set[str]]:
-    payload = json.loads(raw_response)
+    payload = json.loads(normalize_json_response(raw_response))
     rows: list[dict[str, str]] = []
     returned_tickers: set[str] = set()
     for company in payload.get("companies", []):
