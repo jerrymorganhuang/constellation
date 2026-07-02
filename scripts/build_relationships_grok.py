@@ -22,6 +22,7 @@ DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "constellation.db"
 RELATIONSHIPS_CSV_PATH = DATA_DIR / "relationships_raw.csv"
 MISSING_COMPANIES_CSV_PATH = DATA_DIR / "missing_companies.csv"
+RETRY_COMPANIES_CSV_PATH = DATA_DIR / "retry_companies.csv"
 DEBUG_BATCH_DIR = DATA_DIR / "debug" / "grok_relationship_batches"
 EXTRACTION_METHOD = "grok_api"
 VALID_ROLE_CATEGORIES = {"EXECUTIVE", "BOARD"}
@@ -121,6 +122,25 @@ def fetch_companies(connection: sqlite3.Connection, universe: str | None, ticker
 
 def chunks(items: list[tuple[str, str]], size: int) -> list[list[tuple[str, str]]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def load_retry_companies_csv(path: Path) -> list[tuple[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        required_columns = {"ticker", "company_name"}
+        missing_columns = sorted(required_columns - fieldnames)
+        if missing_columns:
+            raise ValueError(f"--retry-file must include columns: {', '.join(sorted(required_columns))}; missing: {', '.join(missing_columns)}")
+
+        companies: list[tuple[str, str]] = []
+        for line_number, row in enumerate(reader, start=2):
+            ticker = str(row.get("ticker", "")).strip().upper()
+            company_name = str(row.get("company_name", "")).strip()
+            if not ticker or not company_name:
+                raise ValueError(f"--retry-file row {line_number} must include non-empty ticker and company_name")
+            companies.append((ticker, company_name))
+        return companies
 
 
 def is_completed(connection: sqlite3.Connection, batch_id: str) -> bool:
@@ -286,6 +306,49 @@ def append_missing_companies_csv(missing_tickers: list[str], batch_id: str) -> N
         writer = csv.writer(handle)
         writer.writerows((ticker, batch_id, "missing_from_response", created_at) for ticker in missing_tickers)
 
+
+def company_name_by_ticker(companies: list[tuple[str, str]]) -> dict[str, str]:
+    return {ticker: company_name for ticker, company_name in companies}
+
+
+class RetryCompaniesCsv:
+    header = ["ticker", "company_name", "batch_id", "reason", "created_at"]
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.rows_by_ticker: dict[str, dict[str, str]] = {}
+
+    def reset(self) -> None:
+        self.rows_by_ticker.clear()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._write()
+
+    def add_companies(self, companies: list[tuple[str, str]], batch_id: str, reason: str) -> None:
+        if not companies:
+            return
+        created_at = utc_now()
+        for ticker, company_name in companies:
+            normalized_ticker = ticker.strip().upper()
+            self.rows_by_ticker[normalized_ticker] = {
+                "ticker": normalized_ticker,
+                "company_name": company_name,
+                "batch_id": batch_id,
+                "reason": reason,
+                "created_at": created_at,
+            }
+        self._write()
+
+    def _write(self) -> None:
+        with self.path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.header)
+            writer.writeheader()
+            writer.writerows(self.rows_by_ticker.values())
+
+    @property
+    def count(self) -> int:
+        return len(self.rows_by_ticker)
+
+
 def write_debug(
     batch_id: str,
     raw_request: str,
@@ -318,6 +381,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Grok model name.")
     parser.add_argument("--resume", action="store_true", help="Skip batches already marked success.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned batches without calling Grok.")
+    parser.add_argument("--retry-file", type=Path, help="Load ticker and company_name rows from retry CSV instead of normal universe/offset/limit selection.")
     args = parser.parse_args()
 
     if args.batch_size < 1:
@@ -327,10 +391,15 @@ def main() -> None:
 
     with connect() as connection:
         create_tables(connection)
-        companies = fetch_companies(connection, args.universe, args.ticker)
-        companies = companies[args.offset :]
-        if args.limit is not None:
-            companies = companies[: args.limit]
+        if args.retry_file:
+            companies = load_retry_companies_csv(args.retry_file)
+            if args.offset != 0 or args.limit is not None:
+                print("Retry-file mode bypasses --offset and --limit.")
+        else:
+            companies = fetch_companies(connection, args.universe, args.ticker)
+            companies = companies[args.offset :]
+            if args.limit is not None:
+                companies = companies[: args.limit]
         company_batches = chunks(companies, args.batch_size)
         total_relationships = 0
         total_input_tokens = 0
@@ -343,7 +412,12 @@ def main() -> None:
         missing_ticker_count = 0
         failed_company_count = 0
         initialize_missing_companies_csv()
-        print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es) with offset={args.offset}, limit={args.limit}.")
+        retry_companies_csv = RetryCompaniesCsv(RETRY_COMPANIES_CSV_PATH)
+        retry_companies_csv.reset()
+        if args.retry_file:
+            print(f"Planning {len(companies)} companies from retry file {args.retry_file} in {len(company_batches)} batches.")
+        else:
+            print(f"Planning {len(companies)} companies in {len(company_batches)} batch(es) with offset={args.offset}, limit={args.limit}.")
         for index, batch in enumerate(company_batches, start=1):
             batch_id = batch_id_for(batch, args.model)
             tickers = [ticker for ticker, _ in batch]
@@ -367,6 +441,7 @@ def main() -> None:
                     write_debug(batch_id, raw_request, raw_response, error_message, response_json)
                     failed_batches += 1
                     failed_company_count += len(tickers)
+                    retry_companies_csv.add_companies(batch, batch_id, "no_final_text")
                     if metadata.input_tokens is not None:
                         total_input_tokens += metadata.input_tokens
                     if metadata.output_tokens is not None:
@@ -390,6 +465,7 @@ def main() -> None:
                     write_debug(batch_id, raw_request, raw_response, error_message, response_json)
                     failed_batches += 1
                     failed_company_count += len(tickers)
+                    retry_companies_csv.add_companies(batch, batch_id, "invalid_json")
                     if metadata.input_tokens is not None:
                         total_input_tokens += metadata.input_tokens
                     if metadata.output_tokens is not None:
@@ -400,6 +476,24 @@ def main() -> None:
                         total_cost_usd += cost_usd
                     print(f"Batch {index}/{len(company_batches)} failed: invalid_json")
                     continue
+                except Exception as error:  # noqa: BLE001 - parser failures must be persisted per batch.
+                    error_message = f"parse_exception: {error}"
+                    upsert_batch(connection, batch_id, tickers, "failed", raw_request, raw_response, error_message, metadata, cost_usd)
+                    connection.commit()
+                    write_debug(batch_id, raw_request, raw_response, error_message, response_json)
+                    failed_batches += 1
+                    failed_company_count += len(tickers)
+                    retry_companies_csv.add_companies(batch, batch_id, "parse_exception")
+                    if metadata.input_tokens is not None:
+                        total_input_tokens += metadata.input_tokens
+                    if metadata.output_tokens is not None:
+                        total_output_tokens += metadata.output_tokens
+                    if metadata.total_tokens is not None:
+                        total_tokens += metadata.total_tokens
+                    if cost_usd is not None:
+                        total_cost_usd += cost_usd
+                    print(f"Batch {index}/{len(company_batches)} failed: parse_exception")
+                    continue
                 missing_tickers = sorted(set(tickers) - returned_tickers)
                 status = "partial" if missing_tickers else "success"
                 error_message = f"Missing tickers: {', '.join(missing_tickers)}" if missing_tickers else None
@@ -409,6 +503,12 @@ def main() -> None:
                 export_relationships_csv(connection)
                 write_debug(batch_id, raw_request, raw_response, None, response_json)
                 append_missing_companies_csv(missing_tickers, batch_id)
+                ticker_to_company_name = company_name_by_ticker(batch)
+                retry_companies_csv.add_companies(
+                    [(ticker, ticker_to_company_name[ticker]) for ticker in missing_tickers],
+                    batch_id,
+                    "missing_from_response",
+                )
                 if status == "partial":
                     partial_batches += 1
                     missing_ticker_count += len(missing_tickers)
@@ -437,6 +537,7 @@ def main() -> None:
                 write_debug(batch_id, raw_request, None, message)
                 failed_batches += 1
                 failed_company_count += len(tickers)
+                retry_companies_csv.add_companies(batch, batch_id, "api_exception")
                 print(f"Batch {index}/{len(company_batches)} failed: {error}")
                 print(message, file=sys.stderr, end="")
         print("Final run summary:")
@@ -445,6 +546,8 @@ def main() -> None:
         print(f"Failed batches: {failed_batches}")
         print(f"Failed company count: {failed_company_count}")
         print(f"Missing ticker count: {missing_ticker_count}")
+        print(f"Retry ticker count: {retry_companies_csv.count}")
+        print(f"Retry companies file: {RETRY_COMPANIES_CSV_PATH.relative_to(ROOT_DIR)}")
         print(f"Total relationships: {total_relationships}")
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
