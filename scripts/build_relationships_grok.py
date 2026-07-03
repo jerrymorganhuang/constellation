@@ -60,6 +60,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
             person_key TEXT,
             role TEXT,
             role_category TEXT,
+            company_name TEXT,
             batch_id TEXT,
             extraction_method TEXT,
             created_at TEXT,
@@ -81,8 +82,15 @@ def create_tables(connection: sqlite3.Connection) -> None:
         ON relationships_raw (ticker, person_key, role, role_category);
         """
     )
+    ensure_relationships_raw_company_name_column(connection)
     ensure_relationship_batch_usage_columns(connection)
     connection.commit()
+
+
+def ensure_relationships_raw_company_name_column(connection: sqlite3.Connection) -> None:
+    existing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(relationships_raw)").fetchall()}
+    if "company_name" not in existing_columns:
+        connection.execute("ALTER TABLE relationships_raw ADD COLUMN company_name TEXT")
 
 
 def ensure_relationship_batch_usage_columns(connection: sqlite3.Connection) -> None:
@@ -260,14 +268,20 @@ def parse_relationships(raw_response: str) -> tuple[list[dict[str, str]], set[st
     return rows, returned_tickers
 
 
+def add_company_names(rows: list[dict[str, str]], companies: list[tuple[str, str]]) -> list[dict[str, str]]:
+    ticker_to_company_name = company_name_by_ticker(companies)
+    return [dict(row, company_name=ticker_to_company_name.get(row["ticker"], "")) for row in rows]
+
+
 def insert_relationships(connection: sqlite3.Connection, rows: list[dict[str, str]], batch_id: str) -> None:
     now = utc_now()
     connection.executemany(
         """
-        INSERT INTO relationships_raw (ticker, person_name, person_key, role, role_category, batch_id, extraction_method, created_at, updated_at)
-        VALUES (:ticker, :person_name, :person_key, :role, :role_category, :batch_id, :extraction_method, :created_at, :updated_at)
+        INSERT INTO relationships_raw (ticker, person_name, person_key, role, role_category, company_name, batch_id, extraction_method, created_at, updated_at)
+        VALUES (:ticker, :person_name, :person_key, :role, :role_category, :company_name, :batch_id, :extraction_method, :created_at, :updated_at)
         ON CONFLICT(ticker, person_key, role, role_category) DO UPDATE SET
             person_name = excluded.person_name,
+            company_name = excluded.company_name,
             batch_id = excluded.batch_id,
             extraction_method = excluded.extraction_method,
             updated_at = excluded.updated_at
@@ -280,14 +294,14 @@ def export_relationships_csv(connection: sqlite3.Connection) -> None:
     RELATIONSHIPS_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     rows = connection.execute(
         """
-        SELECT id, ticker, person_name, person_key, role, role_category, batch_id, extraction_method, created_at, updated_at
+        SELECT id, ticker, person_name, person_key, role, role_category, company_name, batch_id, extraction_method, created_at, updated_at
         FROM relationships_raw
         ORDER BY ticker, person_key, role_category, role
         """
     ).fetchall()
     with RELATIONSHIPS_CSV_PATH.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["id", "ticker", "person_name", "person_key", "role", "role_category", "batch_id", "extraction_method", "created_at", "updated_at"])
+        writer.writerow(["id", "ticker", "person_name", "person_key", "role", "role_category", "company_name", "batch_id", "extraction_method", "created_at", "updated_at"])
         writer.writerows([tuple(row) for row in rows])
 
 
@@ -497,6 +511,7 @@ def main() -> None:
                 missing_tickers = sorted(set(tickers) - returned_tickers)
                 status = "partial" if missing_tickers else "success"
                 error_message = f"Missing tickers: {', '.join(missing_tickers)}" if missing_tickers else None
+                rows = add_company_names(rows, batch)
                 insert_relationships(connection, rows, batch_id)
                 upsert_batch(connection, batch_id, tickers, status, raw_request, raw_response, error_message, metadata, cost_usd)
                 connection.commit()

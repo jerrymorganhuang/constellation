@@ -1,5 +1,6 @@
 import importlib.util
 import csv
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -61,6 +62,40 @@ class RelationshipParserTest(unittest.TestCase):
 
         self.assertEqual(rows, [])
         self.assertEqual(returned_tickers, {"AAPL"})
+
+
+class RelationshipPersistenceTest(unittest.TestCase):
+    def test_insert_and_export_persist_company_name_from_input_company_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "relationships_raw.csv"
+            original_csv_path = build_relationships_grok.RELATIONSHIPS_CSV_PATH
+            build_relationships_grok.RELATIONSHIPS_CSV_PATH = csv_path
+            try:
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                build_relationships_grok.create_tables(connection)
+                rows = [
+                    {
+                        "ticker": "NVDA",
+                        "person_name": "Jensen Huang",
+                        "person_key": "JENSEN_HUANG",
+                        "role": "President and Chief Executive Officer",
+                        "role_category": "EXECUTIVE",
+                    }
+                ]
+                enriched_rows = build_relationships_grok.add_company_names(rows, [("NVDA", "NVIDIA Corporation")])
+
+                build_relationships_grok.insert_relationships(connection, enriched_rows, "batch_1")
+                build_relationships_grok.export_relationships_csv(connection)
+
+                db_row = connection.execute("SELECT company_name FROM relationships_raw WHERE ticker = ?", ("NVDA",)).fetchone()
+                with csv_path.open(newline="", encoding="utf-8") as handle:
+                    csv_rows = list(csv.DictReader(handle))
+            finally:
+                build_relationships_grok.RELATIONSHIPS_CSV_PATH = original_csv_path
+
+        self.assertEqual(db_row["company_name"], "NVIDIA Corporation")
+        self.assertEqual(csv_rows[0]["company_name"], "NVIDIA Corporation")
 
 
 class RetryCompaniesCsvTest(unittest.TestCase):
