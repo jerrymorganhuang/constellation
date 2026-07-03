@@ -96,13 +96,14 @@ def select_latest_snapshot_rows(rows: Iterable[sqlite3.Row | dict[str, Any]]) ->
 
     selected: list[sqlite3.Row | dict[str, Any]] = []
     for ticker_rows in rows_by_ticker.values():
-        latest = max(ticker_rows, key=raw_sort_key)
-        latest_batch_id = latest["batch_id"] if "batch_id" in latest.keys() else None
-        latest_time = source_extraction_time(latest)
-        if latest_batch_id:
-            selected.extend(row for row in ticker_rows if row["batch_id"] == latest_batch_id)
+        updated_at_values = [row["updated_at"] for row in ticker_rows if row["updated_at"]]
+        if updated_at_values:
+            latest_time = max(updated_at_values)
+            selected.extend(row for row in ticker_rows if row["updated_at"] == latest_time)
         else:
-            selected.extend(row for row in ticker_rows if source_extraction_time(row) == latest_time)
+            created_at_values = [row["created_at"] for row in ticker_rows if row["created_at"]]
+            latest_time = max(created_at_values, default="")
+            selected.extend(row for row in ticker_rows if (row["created_at"] or "") == latest_time)
     return selected, skipped
 
 

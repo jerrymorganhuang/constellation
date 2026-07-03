@@ -97,18 +97,66 @@ class NormalizeRelationshipsTest(unittest.TestCase):
             "CEO",
         )
 
-    def test_snapshot_latest_ticker_logic(self):
-        self.insert_raw(ticker="NVDA", person_name="Old Person", batch_id="old", created_at="2026-01-01T00:00:00+00:00")
-        self.insert_raw(ticker="NVDA", person_name="New CEO", batch_id="new", created_at="2026-02-01T00:00:00+00:00")
-        self.insert_raw(ticker="NVDA", person_name="New CFO", role="Chief Financial Officer", batch_id="new", created_at="2026-02-01T00:00:00+00:00")
-        self.insert_raw(ticker="AAPL", person_name="Apple CEO", batch_id="apple", created_at="2026-01-15T00:00:00+00:00")
+    def test_snapshot_latest_ticker_logic_uses_latest_updated_at(self):
+        self.insert_raw(
+            ticker="NVDA",
+            person_name="Old Person",
+            batch_id="same_batch",
+            created_at="2026-06-30T00:00:00+00:00",
+            updated_at="2026-06-30T12:00:00+00:00",
+        )
+        self.insert_raw(
+            ticker="NVDA",
+            person_name="New CEO",
+            batch_id="same_batch",
+            created_at="2026-07-01T00:00:00+00:00",
+            updated_at="2026-07-01T12:00:00+00:00",
+        )
+        self.insert_raw(
+            ticker="NVDA",
+            person_name="New CFO",
+            role="Chief Financial Officer",
+            batch_id="different_batch",
+            created_at="2026-07-01T00:00:00+00:00",
+            updated_at="2026-07-01T12:00:00+00:00",
+        )
+        self.insert_raw(
+            ticker="AAPL",
+            person_name="Apple CEO",
+            batch_id="apple",
+            created_at="2026-01-15T00:00:00+00:00",
+            updated_at="2026-01-15T12:00:00+00:00",
+        )
 
         output_path, summary = self.normalize_to_temp_csv()
 
-        names = [row["person_name"] for row in self.connection.execute("SELECT person_name FROM relationships ORDER BY person_name")]
-        self.assertEqual(names, ["Apple CEO", "New CEO", "New CFO"])
+        rows = self.connection.execute("SELECT person_name, extraction_time FROM relationships ORDER BY person_name").fetchall()
+        self.assertEqual([row["person_name"] for row in rows], ["Apple CEO", "New CEO", "New CFO"])
+        self.assertNotIn("Old Person", [row["person_name"] for row in rows])
+        self.assertEqual(
+            {row["extraction_time"] for row in rows if row["person_name"].startswith("New")},
+            {"2026-07-01T12:00:00+00:00"},
+        )
         self.assertEqual(summary["selected_latest_snapshot_row_count"], 3)
         self.assertTrue(output_path.exists())
+
+    def test_snapshot_latest_ticker_logic_falls_back_to_created_at_when_updated_at_is_null(self):
+        self.insert_raw(ticker="MSFT", person_name="Old Person", created_at="2026-06-30T00:00:00+00:00", updated_at=None)
+        self.insert_raw(ticker="MSFT", person_name="New CEO", created_at="2026-07-01T00:00:00+00:00", updated_at=None)
+        self.insert_raw(
+            ticker="MSFT",
+            person_name="New CFO",
+            role="Chief Financial Officer",
+            created_at="2026-07-01T00:00:00+00:00",
+            updated_at=None,
+        )
+
+        self.normalize_to_temp_csv()
+
+        rows = self.connection.execute("SELECT person_name, extraction_time FROM relationships ORDER BY person_name").fetchall()
+        self.assertEqual([row["person_name"] for row in rows], ["New CEO", "New CFO"])
+        self.assertNotIn("Old Person", [row["person_name"] for row in rows])
+        self.assertEqual({row["extraction_time"] for row in rows}, {"2026-07-01T00:00:00+00:00"})
 
     def test_dedup_keeps_newest_row(self):
         self.insert_raw(person_name="Dr. Lisa T. Su", role="CEO", created_at="2026-01-01T00:00:00+00:00", batch_id="latest")
