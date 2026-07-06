@@ -82,19 +82,94 @@ class NormalizeRelationshipsTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(normalize_relationships.person_id_for(source), expected)
 
+    def test_parent_company_ceo_titles_normalize_within_executive(self):
+        cases = [
+            "CEO",
+            "Chief Executive Officer",
+            "President and CEO",
+            "President & CEO",
+            "President and Chief Executive Officer",
+            "President & Chief Executive Officer",
+            "Interim CEO",
+            "Interim Chief Executive Officer",
+            "Acting CEO",
+            "Acting Chief Executive Officer",
+            "Co-CEO",
+            "Co-Chief Executive Officer",
+            "  President   and   CEO.  ",
+        ]
+        for role in cases:
+            with self.subTest(role=role):
+                self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), "CEO")
+
+    def test_business_unit_ceo_titles_do_not_normalize(self):
+        cases = [
+            "CEO, Schwab Asset Management",
+            "CEO of Schwab Bank",
+            "President and CEO, Schwab Asset Management",
+            "Chief Executive Officer of Schwab Bank",
+            "CEO, International",
+            "CEO, Wealth Management",
+            "CEO of Global Banking",
+            "CEO, Americas",
+            "CEO, Europe",
+            "CEO, Consumer Banking",
+            "CEO, Asset Management",
+            "CEO, Investment Platforms",
+            "CEO, Services",
+            "CEO of Subsidiary Name",
+        ]
+        for role in cases:
+            with self.subTest(role=role):
+                self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), role)
+
+    def test_parent_company_cfo_titles_normalize_within_executive(self):
+        cases = [
+            "CFO",
+            "Chief Financial Officer",
+            "Executive Vice President and CFO",
+            "EVP and CFO",
+            "Senior Vice President and CFO",
+            "SVP and CFO",
+            "Interim CFO",
+            "Acting CFO",
+            "Interim Chief Financial Officer",
+            "Acting Chief Financial Officer",
+            "  EVP   and   CFO;  ",
+        ]
+        for role in cases:
+            with self.subTest(role=role):
+                self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), "CFO")
+
+    def test_business_unit_cfo_titles_do_not_normalize(self):
+        cases = [
+            "CFO, Schwab Asset Management",
+            "CFO of Schwab Bank",
+            "Chief Financial Officer of International",
+            "CFO, Consumer Banking",
+            "CFO, Americas",
+            "Divisional CFO",
+            "Segment CFO",
+        ]
+        for role in cases:
+            with self.subTest(role=role):
+                self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), role)
+
     def test_ceo_cfo_only_normalized_within_executive(self):
-        self.assertEqual(normalize_relationships.normalized_role("President and Chief Executive Officer", "EXECUTIVE"), "CEO")
-        self.assertEqual(normalize_relationships.normalized_role("Chief Financial Officer", "EXECUTIVE"), "CFO")
         self.assertEqual(
-            normalize_relationships.normalized_role("Chief Executive Officer and Director", "BOARD"),
-            "Chief Executive Officer and Director",
+            normalize_relationships.normalized_role("Chief Executive Officer", "BOARD"),
+            "Chief Executive Officer",
+        )
+        self.assertEqual(
+            normalize_relationships.normalized_role("Chief Financial Officer", "BOARD"),
+            "Chief Financial Officer",
         )
 
     def test_chairman_only_normalized_within_board(self):
         self.assertEqual(normalize_relationships.normalized_role("Independent Chair of the Board", "BOARD"), "Chairman")
         self.assertEqual(
             normalize_relationships.normalized_role("Executive Chair and Chief Executive Officer", "EXECUTIVE"),
-            "CEO",
+            "Executive Chair and Chief Executive Officer",
         )
 
     def test_snapshot_latest_ticker_logic_uses_latest_updated_at(self):

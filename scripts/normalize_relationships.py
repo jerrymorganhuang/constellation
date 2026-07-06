@@ -47,14 +47,51 @@ def person_id_for(person_name: str) -> str:
     return cleaned.replace(" ", "_")
 
 
+CEO_UNIT_QUALIFIER_RE = re.compile(
+    r"(?:\bCEO\b|\bChief\s+Executive\s+Officer\b)\s*(?:,|:|[-–—]|/|\bof\b|\bfor\b)\s*\S",
+    flags=re.IGNORECASE,
+)
+CEO_PARENT_TITLE_RE = re.compile(
+    r"(?:"
+    r"CEO|"
+    r"Chief\s+Executive\s+Officer|"
+    r"President\s+(?:and|&)\s+CEO|"
+    r"President\s+(?:and|&)\s+Chief\s+Executive\s+Officer|"
+    r"(?:Interim|Acting)\s+CEO|"
+    r"(?:Interim|Acting)\s+Chief\s+Executive\s+Officer|"
+    r"Co-CEO|"
+    r"Co-Chief\s+Executive\s+Officer"
+    r")\s*[.;,]*",
+    flags=re.IGNORECASE,
+)
+CFO_UNIT_QUALIFIER_RE = re.compile(
+    r"(?:\bCFO\b|\bChief\s+Financial\s+Officer\b)\s*(?:,|:|[-–—]|/|\bof\b|\bfor\b)\s*\S",
+    flags=re.IGNORECASE,
+)
+CFO_PARENT_TITLE_RE = re.compile(
+    r"(?:"
+    r"CFO|"
+    r"Chief\s+Financial\s+Officer|"
+    r"Executive\s+Vice\s+President\s+(?:and|&)\s+CFO|"
+    r"EVP\s+(?:and|&)\s+CFO|"
+    r"Senior\s+Vice\s+President\s+(?:and|&)\s+CFO|"
+    r"SVP\s+(?:and|&)\s+CFO|"
+    r"(?:Interim|Acting)\s+CFO|"
+    r"(?:Interim|Acting)\s+Chief\s+Financial\s+Officer"
+    r")\s*[.;,]*",
+    flags=re.IGNORECASE,
+)
+
+
 def normalized_role(role: str, role_category: str) -> str:
     category = role_category.strip()
+    normalized = collapse_spaces(role)
     if category == "EXECUTIVE":
-        if re.search(r"\bCEO\b|Chief Executive Officer", role, flags=re.IGNORECASE):
+        if not CEO_UNIT_QUALIFIER_RE.search(normalized) and CEO_PARENT_TITLE_RE.fullmatch(normalized):
             return "CEO"
-        if re.search(r"\bCFO\b|Chief Financial Officer", role, flags=re.IGNORECASE):
+        if not CFO_UNIT_QUALIFIER_RE.search(normalized) and CFO_PARENT_TITLE_RE.fullmatch(normalized):
             return "CFO"
-    if category == "BOARD" and re.search(r"chair", role, flags=re.IGNORECASE):
+    if category == "BOARD" and re.search(r"chair", normalized, flags=re.IGNORECASE):
         return "Chairman"
     return role.strip()
 
