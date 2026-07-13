@@ -125,3 +125,49 @@ def test_comma_separated_extra_origins_are_trimmed_and_included(tmp_path, monkey
         "https://one.example",
         "https://two.example",
     )
+
+
+def test_full_graph_preserves_isolated_company_and_person_nodes():
+    from app.backend.graph_service import GraphService
+
+    service = object.__new__(GraphService)
+    calls = []
+
+    company = {"ticker": "NVDA", "company_name": "NVIDIA Corporation"}
+    isolated_company = {"ticker": "GSBC", "company_name": "Great Southern Bancorp, Inc."}
+    person = {"person_id": "JENSEN_HUANG", "person_name": "Jensen Huang"}
+    isolated_person = {"person_id": "ISOLATED_PERSON", "person_name": "Isolated Person"}
+    rel = {"role": "CEO", "role_category": "CEO", "extraction_time": "2026-01-01T00:00:00Z"}
+
+    def fake_read(query, **params):
+        calls.append(query)
+        if query == "MATCH (c:Company) RETURN c":
+            return [{"c": company}, {"c": isolated_company}]
+        if query == "MATCH (p:Person) RETURN p":
+            return [{"p": person}, {"p": isolated_person}]
+        if "MATCH (p:Person)-[r:" in query:
+            return [{"p": person, "r": rel, "c": company, "relationship": "CEO_OF"}]
+        raise AssertionError(f"unexpected query: {query}")
+
+    service._read = fake_read
+
+    graph = service.full_graph()
+
+    node_ids = {node["data"]["id"] for node in graph["nodes"]}
+    assert node_ids == {
+        "company:NVDA",
+        "company:GSBC",
+        "person:JENSEN_HUANG",
+        "person:ISOLATED_PERSON",
+    }
+    assert len(graph["edges"]) == 1
+    assert graph["edges"][0]["data"]["source"] == "person:JENSEN_HUANG"
+    assert graph["edges"][0]["data"]["target"] == "company:NVDA"
+    assert calls == [
+        "MATCH (c:Company) RETURN c",
+        "MATCH (p:Person) RETURN p",
+        (
+            "MATCH (p:Person)-[r:CEO_OF|CFO_OF|CHAIRMAN_OF|BOARD_OF|EXECUTIVE_OF]->(c:Company) "
+            "RETURN p, r, c, type(r) AS relationship"
+        ),
+    ]
