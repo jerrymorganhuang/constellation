@@ -93,78 +93,46 @@ class NormalizeRelationshipsTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(normalize_relationships.person_id_for(source), expected)
 
-    def test_parent_company_ceo_titles_normalize_within_executive(self):
+    def test_broad_ceo_titles_normalize_within_executive(self):
         cases = [
             "CEO",
-            "Chief Executive Officer",
+            "Group CEO",
+            "Co-CEO",
+            "Interim CEO",
+            "Acting CEO",
+            "CEO, Schwab Asset Management",
+            "CEO of Schwab Bank",
             "President and CEO",
             "President & CEO",
+            "Chief Executive Officer",
             "President and Chief Executive Officer",
-            "President & Chief Executive Officer",
-            "Interim CEO",
-            "Interim Chief Executive Officer",
-            "Acting CEO",
-            "Acting Chief Executive Officer",
-            "Co-CEO",
-            "Co-Chief Executive Officer",
+            "Chief Executive Officer, The Charles Schwab Corporation",
+            "Chief Executive Officer - Americas",
+            "Executive Chair and Chief Executive Officer",
             "  President   and   CEO.  ",
         ]
         for role in cases:
             with self.subTest(role=role):
                 self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), "CEO")
 
-    def test_business_unit_ceo_titles_do_not_normalize(self):
-        cases = [
-            "CEO, Schwab Asset Management",
-            "CEO of Schwab Bank",
-            "President and CEO, Schwab Asset Management",
-            "Chief Executive Officer of Schwab Bank",
-            "CEO, International",
-            "CEO, Wealth Management",
-            "CEO of Global Banking",
-            "CEO, Americas",
-            "CEO, Europe",
-            "CEO, Consumer Banking",
-            "CEO, Asset Management",
-            "CEO, Investment Platforms",
-            "CEO, Services",
-            "CEO of Subsidiary Name",
-        ]
-        for role in cases:
-            with self.subTest(role=role):
-                self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), role)
-
-    def test_parent_company_cfo_titles_normalize_within_executive(self):
+    def test_broad_cfo_titles_normalize_within_executive(self):
         cases = [
             "CFO",
-            "Chief Financial Officer",
-            "Executive Vice President and CFO",
-            "EVP and CFO",
-            "Senior Vice President and CFO",
-            "SVP and CFO",
+            "Group CFO",
+            "Co-CFO",
             "Interim CFO",
             "Acting CFO",
-            "Interim Chief Financial Officer",
-            "Acting Chief Financial Officer",
+            "CFO, Business Unit",
+            "CFO of Subsidiary",
+            "Executive Vice President and CFO",
+            "Chief Financial Officer",
+            "Chief Financial Officer, Company Name",
+            "Chief Financial Officer - Americas",
             "  EVP   and   CFO;  ",
         ]
         for role in cases:
             with self.subTest(role=role):
                 self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), "CFO")
-
-    def test_business_unit_cfo_titles_do_not_normalize(self):
-        cases = [
-            "CFO, Schwab Asset Management",
-            "CFO of Schwab Bank",
-            "Chief Financial Officer of International",
-            "CFO, Consumer Banking",
-            "CFO, Americas",
-            "Divisional CFO",
-            "Segment CFO",
-        ]
-        for role in cases:
-            with self.subTest(role=role):
-                self.assertEqual(normalize_relationships.normalized_role(role, "EXECUTIVE"), role)
 
     def test_ceo_cfo_only_normalized_within_executive(self):
         self.assertEqual(
@@ -180,7 +148,7 @@ class NormalizeRelationshipsTest(unittest.TestCase):
         self.assertEqual(normalize_relationships.normalized_role("Independent Chair of the Board", "BOARD"), "Chairman")
         self.assertEqual(
             normalize_relationships.normalized_role("Executive Chair and Chief Executive Officer", "EXECUTIVE"),
-            "Executive Chair and Chief Executive Officer",
+            "CEO",
         )
 
     def test_snapshot_latest_ticker_logic_uses_latest_updated_at(self):
@@ -254,6 +222,36 @@ class NormalizeRelationshipsTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["person_name"], "Lisa T Su")
         self.assertEqual(rows[0]["extraction_time"], "2026-01-02T00:00:00+00:00")
+
+    def test_multiple_ceo_rows_for_one_ticker_may_be_retained(self):
+        self.insert_raw(ticker="NVDA", person_name="CEO One", role="CEO")
+        self.insert_raw(ticker="NVDA", person_name="CEO Two", role="CEO")
+
+        self.normalize_to_temp_csv(company_tickers=["NVDA"])
+
+        rows = self.connection.execute("SELECT person_name, role FROM relationships ORDER BY person_name").fetchall()
+        self.assertEqual([(row["person_name"], row["role"]) for row in rows], [("CEO One", "CEO"), ("CEO Two", "CEO")])
+
+    def test_batch_id_does_not_affect_snapshot_selection(self):
+        self.insert_raw(
+            ticker="NVDA",
+            person_name="Old Batch Person",
+            batch_id="zzzz",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T12:00:00+00:00",
+        )
+        self.insert_raw(
+            ticker="NVDA",
+            person_name="Latest Batch Person",
+            batch_id="aaaa",
+            created_at="2026-01-02T00:00:00+00:00",
+            updated_at="2026-01-02T12:00:00+00:00",
+        )
+
+        self.normalize_to_temp_csv(company_tickers=["NVDA"])
+
+        rows = self.connection.execute("SELECT person_name FROM relationships").fetchall()
+        self.assertEqual([row["person_name"] for row in rows], ["Latest Batch Person"])
 
     def test_company_master_filter_excludes_raw_ticker_absent_from_canonical_output(self):
         self.insert_raw(ticker="NVDA", person_name="Valid CEO")
