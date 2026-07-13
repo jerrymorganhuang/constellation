@@ -90,14 +90,23 @@ class GraphService:
         if radius == 1:
             query = f"MATCH (p:Person)-[r:{REL_PATTERN}]->(c:Company {{ticker: $ticker}}) RETURN p, r, c, type(r) AS relationship"
         else:
-            query = f"MATCH (:Company {{ticker: $ticker}})<-[:{REL_PATTERN}]-(shared:Person)-[r:{REL_PATTERN}]->(c:Company) WITH DISTINCT shared AS p, r, c RETURN p, r, c, type(r) AS relationship"
+            query = f"""
+            MATCH (start:Company {{ticker: $ticker}})<-[:{REL_PATTERN}]-(p:Person)
+            MATCH (p)-[r:{REL_PATTERN}]->(c:Company)
+            RETURN DISTINCT p, r, c, type(r) AS relationship
+            """
         return self._graph(self._read(query, ticker=ticker))
 
     def person_graph(self, person_id: str, radius: int) -> dict[str, list[dict[str, Any]]]:
         if radius == 1:
             query = f"MATCH (p:Person {{person_id: $person_id}})-[r:{REL_PATTERN}]->(c:Company) RETURN p, r, c, type(r) AS relationship"
         else:
-            query = f"MATCH (start:Person {{person_id: $person_id}})-[:{REL_PATTERN}]->(:Company)<-[:{REL_PATTERN}]-(p:Person)-[r:{REL_PATTERN}]->(c:Company) WITH DISTINCT p, r, c RETURN p, r, c, type(r) AS relationship"
+            query = f"""
+            MATCH (start:Person {{person_id: $person_id}})-[:{REL_PATTERN}]->(first_hop:Company)
+            MATCH (p:Person)-[r:{REL_PATTERN}]->(c:Company)
+            WHERE c = first_hop
+            RETURN DISTINCT p, r, c, type(r) AS relationship
+            """
         return self._graph(self._read(query, person_id=person_id))
 
     def cross_company_graph(self) -> dict[str, list[dict[str, Any]]]:
