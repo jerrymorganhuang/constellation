@@ -171,3 +171,118 @@ def test_full_graph_preserves_isolated_company_and_person_nodes():
             "RETURN p, r, c, type(r) AS relationship"
         ),
     ]
+
+
+def _graph_ids(graph):
+    return (
+        {node["data"]["id"] for node in graph["nodes"]},
+        {edge["data"]["id"] for edge in graph["edges"]},
+    )
+
+
+def _record(person_id, person_name, ticker, company_name, relationship="BOARD_OF", role="Board Member"):
+    return {
+        "p": {"person_id": person_id, "person_name": person_name},
+        "r": {"role": role, "role_category": role, "extraction_time": "2026-01-01T00:00:00Z"},
+        "c": {"ticker": ticker, "company_name": company_name},
+        "relationship": relationship,
+    }
+
+
+def test_company_radius_2_contains_company_radius_1_nodes_and_edges():
+    from app.backend.graph_service import GraphService
+
+    service = object.__new__(GraphService)
+    radius_1_records = [
+        _record("CEO_ONLY", "CEO Only", "NVDA", "NVIDIA Corporation", "CEO_OF", "CEO"),
+        _record("SHARED_EXEC", "Shared Exec", "NVDA", "NVIDIA Corporation"),
+    ]
+    radius_2_records = [
+        *radius_1_records,
+        _record("SHARED_EXEC", "Shared Exec", "AMD", "Advanced Micro Devices, Inc."),
+    ]
+
+    def fake_read(query, **params):
+        assert params == {"ticker": "NVDA"}
+        if "RETURN DISTINCT p, r, c" in query:
+            assert "MATCH (start:Company {ticker: $ticker})" in query
+            assert "MATCH (p)-[r:" in query
+            return radius_2_records
+        return radius_1_records
+
+    service._read = fake_read
+
+    radius_1_nodes, radius_1_edges = _graph_ids(service.company_graph("NVDA", 1))
+    radius_2_nodes, radius_2_edges = _graph_ids(service.company_graph("NVDA", 2))
+
+    assert radius_1_nodes <= radius_2_nodes
+    assert radius_1_edges <= radius_2_edges
+
+
+def test_company_radius_2_keeps_person_connected_only_to_starting_company():
+    from app.backend.graph_service import GraphService
+
+    service = object.__new__(GraphService)
+
+    def fake_read(query, **params):
+        assert params == {"ticker": "NVDA"}
+        assert "RETURN DISTINCT p, r, c" in query
+        assert "shared:Person" not in query
+        return [
+            _record("CEO_ONLY", "CEO Only", "NVDA", "NVIDIA Corporation", "CEO_OF", "CEO"),
+            _record("SHARED_EXEC", "Shared Exec", "NVDA", "NVIDIA Corporation"),
+            _record("SHARED_EXEC", "Shared Exec", "AMD", "Advanced Micro Devices, Inc."),
+        ]
+
+    service._read = fake_read
+
+    graph = service.company_graph("NVDA", 2)
+    node_ids, edge_ids = _graph_ids(graph)
+
+    assert "person:CEO_ONLY" in node_ids
+    assert "company:NVDA" in node_ids
+    assert stable_edge_id("CEO_ONLY", "NVDA", "CEO_OF", "CEO", "CEO") in edge_ids
+
+
+def test_person_radius_2_contains_person_radius_1_nodes_and_edges():
+    from app.backend.graph_service import GraphService
+
+    service = object.__new__(GraphService)
+    radius_1_records = [
+        _record("JENSEN_HUANG", "Jensen Huang", "NVDA", "NVIDIA Corporation", "CEO_OF", "CEO"),
+        _record("JENSEN_HUANG", "Jensen Huang", "AAPL", "Apple Inc."),
+    ]
+    radius_2_records = [
+        *radius_1_records,
+        _record("OTHER_EXEC", "Other Exec", "NVDA", "NVIDIA Corporation"),
+    ]
+
+    def fake_read(query, **params):
+        assert params == {"person_id": "JENSEN_HUANG"}
+        if "RETURN DISTINCT p, r, c" in query:
+            assert "MATCH (start:Person {person_id: $person_id})" in query
+            assert "WHERE c = first_hop" in query
+            return radius_2_records
+        return radius_1_records
+
+    service._read = fake_read
+
+    radius_1_nodes, radius_1_edges = _graph_ids(service.person_graph("JENSEN_HUANG", 1))
+    radius_2_nodes, radius_2_edges = _graph_ids(service.person_graph("JENSEN_HUANG", 2))
+
+    assert radius_1_nodes <= radius_2_nodes
+    assert radius_1_edges <= radius_2_edges
+
+
+def test_radius_validation_accepts_only_1_and_2():
+    from fastapi import HTTPException
+
+    from app.backend.main import checked_radius
+
+    assert checked_radius(1) == 1
+    assert checked_radius(2) == 2
+    for radius in (0, 3):
+        with pytest.raises(HTTPException) as exc_info:
+            checked_radius(radius)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "radius must be 1 or 2"
