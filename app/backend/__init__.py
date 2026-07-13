@@ -1,1 +1,1 @@
-"""Constellation FastAPI backend package."""
+"""Constellation V1 application backend."""
