@@ -7,6 +7,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = REPO_ROOT / ".env"
+_REQUIRED = object()
 
 
 def _parse_env(path: Path) -> dict[str, str]:
@@ -38,11 +39,11 @@ class Settings:
 def get_settings(env_path: Path = ENV_PATH) -> Settings:
     file_values = _parse_env(env_path)
 
-    def read(name: str, default: str | None = None) -> str:
+    def read(name: str, default: str | object = _REQUIRED) -> str:
         value = file_values.get(name, os.environ.get(name, default))
-        if value is None or value == "":
+        if value is _REQUIRED or (default is _REQUIRED and value == ""):
             raise RuntimeError(f"Missing required environment variable: {name}")
-        return value
+        return str(value)
 
     extra_origins = [o.strip() for o in read("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
     origins = ["http://localhost:5173", "http://127.0.0.1:5173", *extra_origins]
