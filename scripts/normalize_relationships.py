@@ -14,6 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "constellation.db"
 RELATIONSHIPS_CSV_PATH = DATA_DIR / "relationships.csv"
+COMPANIES_CSV_PATH = DATA_DIR / "companies.csv"
 RELATIONSHIPS_COLUMNS = [
     "ticker",
     "company_name",
@@ -96,15 +97,48 @@ def select_latest_snapshot_rows(rows: Iterable[sqlite3.Row | dict[str, Any]]) ->
 
     selected: list[sqlite3.Row | dict[str, Any]] = []
     for ticker_rows in rows_by_ticker.values():
-        latest = max(ticker_rows, key=raw_sort_key)
-        latest_batch_id = latest["batch_id"] if "batch_id" in latest.keys() else None
-        latest_time = source_extraction_time(latest)
-        if latest_batch_id:
-            selected.extend(row for row in ticker_rows if row["batch_id"] == latest_batch_id)
+        updated_at_values = [row["updated_at"] for row in ticker_rows if row["updated_at"]]
+        if updated_at_values:
+            latest_time = max(updated_at_values)
+            selected.extend(row for row in ticker_rows if row["updated_at"] == latest_time)
         else:
-            selected.extend(row for row in ticker_rows if source_extraction_time(row) == latest_time)
+            created_at_values = [row["created_at"] for row in ticker_rows if row["created_at"]]
+            latest_time = max(created_at_values, default="")
+            selected.extend(row for row in ticker_rows if (row["created_at"] or "") == latest_time)
     return selected, skipped
 
+
+def load_company_master_tickers(companies_path: Path) -> set[str]:
+    if not companies_path.exists():
+        raise FileNotFoundError(f"Company Master file not found: {companies_path}")
+
+    with companies_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "ticker" not in reader.fieldnames:
+            raise ValueError(f"Company Master file must contain a ticker column: {companies_path}")
+        return {
+            (row.get("ticker") or "").strip().upper()
+            for row in reader
+            if (row.get("ticker") or "").strip()
+        }
+
+
+def filter_rows_to_company_master(
+    rows: Iterable[sqlite3.Row | dict[str, Any]], company_master_tickers: set[str]
+) -> tuple[list[sqlite3.Row | dict[str, Any]], set[str], int]:
+    rows_list = list(rows)
+    raw_snapshot_tickers = {
+        (row["ticker"] or "").strip().upper()
+        for row in rows_list
+        if (row["ticker"] or "").strip()
+    }
+    excluded_tickers = raw_snapshot_tickers - company_master_tickers
+    filtered_rows = [
+        row
+        for row in rows_list
+        if (row["ticker"] or "").strip().upper() in company_master_tickers
+    ]
+    return filtered_rows, excluded_tickers, len(raw_snapshot_tickers)
 
 def canonicalize_rows(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> tuple[list[dict[str, str]], int]:
     canonical_by_key: dict[tuple[str, str, str, str], tuple[tuple[str, int], dict[str, str]]] = {}
@@ -159,15 +193,27 @@ def export_relationships_csv(rows: list[dict[str, str]], output_path: Path) -> N
         writer.writerows(rows)
 
 
-def normalize(connection: sqlite3.Connection, output_path: Path) -> dict[str, Any]:
+def normalize(
+    connection: sqlite3.Connection, output_path: Path, companies_path: Path = COMPANIES_CSV_PATH
+) -> dict[str, Any]:
+    company_master_tickers = load_company_master_tickers(companies_path)
     source_rows = fetch_raw_rows(connection)
     snapshot_rows, snapshot_skipped = select_latest_snapshot_rows(source_rows)
-    canonical_rows, canonical_skipped = canonicalize_rows(snapshot_rows)
+    filtered_rows, excluded_tickers, raw_snapshot_ticker_count = filter_rows_to_company_master(
+        snapshot_rows, company_master_tickers
+    )
+    canonical_rows, canonical_skipped = canonicalize_rows(filtered_rows)
+    canonical_tickers = {row["ticker"] for row in canonical_rows}
     replace_relationships(connection, canonical_rows)
     export_relationships_csv(canonical_rows, output_path)
     return {
         "source_row_count": len(source_rows),
         "selected_latest_snapshot_row_count": len(snapshot_rows),
+        "company_master_ticker_count": len(company_master_tickers),
+        "raw_snapshot_distinct_ticker_count": raw_snapshot_ticker_count,
+        "excluded_ticker_count": len(excluded_tickers),
+        "excluded_tickers": sorted(excluded_tickers),
+        "canonical_ticker_count": len(canonical_tickers),
         "canonical_relationship_count": len(canonical_rows),
         "skipped_row_count": snapshot_skipped + canonical_skipped,
         "output_csv_path": output_path,
@@ -179,6 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(DB_PATH), type=Path)
     parser.add_argument("--output", default=str(RELATIONSHIPS_CSV_PATH), type=Path)
+    parser.add_argument("--companies", default=str(COMPANIES_CSV_PATH), type=Path)
     return parser.parse_args()
 
 
@@ -186,10 +233,15 @@ def main() -> None:
     args = parse_args()
     with sqlite3.connect(args.db) as connection:
         connection.row_factory = sqlite3.Row
-        summary = normalize(connection, args.output)
+        summary = normalize(connection, args.output, args.companies)
     print(f"source row count: {summary['source_row_count']}")
     print(f"selected latest snapshot row count: {summary['selected_latest_snapshot_row_count']}")
-    print(f"canonical relationship count: {summary['canonical_relationship_count']}")
+    print(f"Company Master ticker count: {summary['company_master_ticker_count']}")
+    print(f"raw snapshot distinct ticker count before filtering: {summary['raw_snapshot_distinct_ticker_count']}")
+    print(f"excluded ticker count: {summary['excluded_ticker_count']}")
+    print(f"sorted excluded ticker list: {summary['excluded_tickers']}")
+    print(f"canonical ticker count: {summary['canonical_ticker_count']}")
+    print(f"canonical relationship row count: {summary['canonical_relationship_count']}")
     print(f"skipped row count: {summary['skipped_row_count']}")
     print(f"output CSV path: {summary['output_csv_path']}")
     print(f"SQLite table name: {summary['sqlite_table_name']}")
