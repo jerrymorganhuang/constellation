@@ -43,6 +43,31 @@ class GraphService:
             edges[edge["data"]["id"]] = edge
         return {"nodes": list(nodes.values()), "edges": list(edges.values())}
 
+    @staticmethod
+    def _full_graph(
+        company_records: list[Any], person_records: list[Any], relationship_records: list[Any]
+    ) -> dict[str, list[dict[str, Any]]]:
+        nodes: dict[str, dict[str, Any]] = {}
+        edges: dict[str, dict[str, Any]] = {}
+
+        for record in company_records:
+            node = company_node(dict(record["c"]))
+            nodes[node["data"]["id"]] = node
+
+        for record in person_records:
+            node = person_node(dict(record["p"]))
+            nodes[node["data"]["id"]] = node
+
+        for record in relationship_records:
+            p = dict(record["p"])
+            c = dict(record["c"])
+            rel = dict(record["r"])
+            rtype = record["relationship"]
+            edge = relationship_edge(p, c, rel, rtype)
+            edges[edge["data"]["id"]] = edge
+
+        return {"nodes": list(nodes.values()), "edges": list(edges.values())}
+
     def health(self) -> dict[str, int | str]:
         query = """
         MATCH (c:Company) WITH count(c) AS companies
@@ -54,7 +79,12 @@ class GraphService:
         return {"status": "ok", "companies": row["companies"], "people": row["people"], "relationships": row["relationships"]}
 
     def full_graph(self) -> dict[str, list[dict[str, Any]]]:
-        return self._graph(self._read(f"MATCH (p:Person)-[r:{REL_PATTERN}]->(c:Company) RETURN p, r, c, type(r) AS relationship"))
+        companies = self._read("MATCH (c:Company) RETURN c")
+        people = self._read("MATCH (p:Person) RETURN p")
+        relationships = self._read(
+            f"MATCH (p:Person)-[r:{REL_PATTERN}]->(c:Company) RETURN p, r, c, type(r) AS relationship"
+        )
+        return self._full_graph(companies, people, relationships)
 
     def company_graph(self, ticker: str, radius: int) -> dict[str, list[dict[str, Any]]]:
         if radius == 1:
