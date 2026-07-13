@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from app.backend.config import get_settings
 from app.backend.schemas import (
     RELATIONSHIP_TYPES,
@@ -62,3 +64,64 @@ def test_explicit_env_path_handling(tmp_path, monkeypatch):
     assert settings.neo4j_uri == "bolt://db:7687"
     assert settings.neo4j_database == "constellation"
     assert "http://vm.local:5173" in settings.cors_allow_origins
+
+
+def _write_required_env(env: Path, extra: str = "") -> None:
+    env.write_text(
+        "NEO4J_URI=bolt://db:7687\n"
+        "NEO4J_USER=neo4j\n"
+        "NEO4J_PASSWORD=secret\n"
+        f"{extra}"
+    )
+
+
+def test_missing_required_variable_raises(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("NEO4J_USER=neo4j\nNEO4J_PASSWORD=secret\n")
+    monkeypatch.delenv("NEO4J_URI", raising=False)
+    monkeypatch.delenv("NEO4J_USER", raising=False)
+    monkeypatch.delenv("NEO4J_PASSWORD", raising=False)
+
+    with pytest.raises(RuntimeError, match="NEO4J_URI"):
+        get_settings(env)
+
+
+def test_optional_empty_string_default_succeeds(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    _write_required_env(env, "CORS_ALLOW_ORIGINS=\n")
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
+
+    settings = get_settings(env)
+
+    assert settings.cors_allow_origins == (
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    )
+
+
+def test_missing_cors_allow_origins_produces_only_localhost_origins(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    _write_required_env(env)
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
+
+    settings = get_settings(env)
+
+    assert settings.cors_allow_origins == (
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    )
+
+
+def test_comma_separated_extra_origins_are_trimmed_and_included(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    _write_required_env(env, "CORS_ALLOW_ORIGINS= https://one.example,https://two.example , , http://localhost:5173 \n")
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
+
+    settings = get_settings(env)
+
+    assert settings.cors_allow_origins == (
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://one.example",
+        "https://two.example",
+    )
