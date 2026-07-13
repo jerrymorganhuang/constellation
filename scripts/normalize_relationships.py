@@ -48,51 +48,14 @@ def person_id_for(person_name: str) -> str:
     return cleaned.replace(" ", "_")
 
 
-CEO_UNIT_QUALIFIER_RE = re.compile(
-    r"(?:\bCEO\b|\bChief\s+Executive\s+Officer\b)\s*(?:,|:|[-–—]|/|\bof\b|\bfor\b)\s*\S",
-    flags=re.IGNORECASE,
-)
-CEO_PARENT_TITLE_RE = re.compile(
-    r"(?:"
-    r"CEO|"
-    r"Chief\s+Executive\s+Officer|"
-    r"President\s+(?:and|&)\s+CEO|"
-    r"President\s+(?:and|&)\s+Chief\s+Executive\s+Officer|"
-    r"(?:Interim|Acting)\s+CEO|"
-    r"(?:Interim|Acting)\s+Chief\s+Executive\s+Officer|"
-    r"Co-CEO|"
-    r"Co-Chief\s+Executive\s+Officer"
-    r")\s*[.;,]*",
-    flags=re.IGNORECASE,
-)
-CFO_UNIT_QUALIFIER_RE = re.compile(
-    r"(?:\bCFO\b|\bChief\s+Financial\s+Officer\b)\s*(?:,|:|[-–—]|/|\bof\b|\bfor\b)\s*\S",
-    flags=re.IGNORECASE,
-)
-CFO_PARENT_TITLE_RE = re.compile(
-    r"(?:"
-    r"CFO|"
-    r"Chief\s+Financial\s+Officer|"
-    r"Executive\s+Vice\s+President\s+(?:and|&)\s+CFO|"
-    r"EVP\s+(?:and|&)\s+CFO|"
-    r"Senior\s+Vice\s+President\s+(?:and|&)\s+CFO|"
-    r"SVP\s+(?:and|&)\s+CFO|"
-    r"(?:Interim|Acting)\s+CFO|"
-    r"(?:Interim|Acting)\s+Chief\s+Financial\s+Officer"
-    r")\s*[.;,]*",
-    flags=re.IGNORECASE,
-)
-
-
 def normalized_role(role: str, role_category: str) -> str:
     category = role_category.strip()
-    normalized = collapse_spaces(role)
     if category == "EXECUTIVE":
-        if not CEO_UNIT_QUALIFIER_RE.search(normalized) and CEO_PARENT_TITLE_RE.fullmatch(normalized):
+        if re.search(r"\bCEO\b|Chief Executive Officer", role, flags=re.IGNORECASE):
             return "CEO"
-        if not CFO_UNIT_QUALIFIER_RE.search(normalized) and CFO_PARENT_TITLE_RE.fullmatch(normalized):
+        if re.search(r"\bCFO\b|Chief Financial Officer", role, flags=re.IGNORECASE):
             return "CFO"
-    if category == "BOARD" and re.search(r"chair", normalized, flags=re.IGNORECASE):
+    if category == "BOARD" and re.search(r"chair", role, flags=re.IGNORECASE):
         return "Chairman"
     return role.strip()
 
@@ -176,6 +139,7 @@ def filter_rows_to_company_master(
         if (row["ticker"] or "").strip().upper() in company_master_tickers
     ]
     return filtered_rows, excluded_tickers, len(raw_snapshot_tickers)
+
 
 def canonicalize_rows(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> tuple[list[dict[str, str]], int]:
     canonical_by_key: dict[tuple[str, str, str, str], tuple[tuple[str, int], dict[str, str]]] = {}
@@ -274,7 +238,7 @@ def main() -> None:
     print(f"source row count: {summary['source_row_count']}")
     print(f"selected latest snapshot row count: {summary['selected_latest_snapshot_row_count']}")
     print(f"Company Master ticker count: {summary['company_master_ticker_count']}")
-    print(f"raw snapshot distinct ticker count before filtering: {summary['raw_snapshot_distinct_ticker_count']}")
+    print(f"raw snapshot distinct ticker count before Company Master filtering: {summary['raw_snapshot_distinct_ticker_count']}")
     print(f"excluded ticker count: {summary['excluded_ticker_count']}")
     print(f"sorted excluded ticker list: {summary['excluded_tickers']}")
     print(f"canonical ticker count: {summary['canonical_ticker_count']}")
