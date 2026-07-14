@@ -23,5 +23,9 @@ data/exports/
 data/cache/
 data/universe_audit.json
 data/debug/
+data/market_data/
 
 data/excluded_companies.csv
+
+# Frontend dependencies
+app/frontend/node_modules/
